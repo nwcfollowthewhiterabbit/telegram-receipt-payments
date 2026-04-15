@@ -288,7 +288,7 @@ class ReceiptPipeline:
         if not extracted_text:
             return ReceiptValidationResult(
                 readable=False,
-                summary="Не удалось извлечь текст из документа.",
+                summary="Не вдалося витягти текст із документа.",
                 missing_fields=["document_text"],
                 raw_text="",
             )

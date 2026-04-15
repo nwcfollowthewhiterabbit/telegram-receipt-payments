@@ -46,24 +46,24 @@ def _render_receipt_result(receipt) -> str:
     built_purpose = PaymentPurposeBuilder.build(validation_view)
     preflight_errors = receipt.validation_payload.get("preflight_errors") or []
     lines = [
-        f"Распарсенный результат [{_mode_label()}]:",
-        f"Поставщик: {receipt.extracted_supplier_name or 'не найден'}",
-        f"ЕДРПОУ/ИНН: {receipt.extracted_supplier_tax_id or 'не найден'}",
-        f"IBAN: {receipt.extracted_supplier_iban or 'не найден'}",
-        f"Банк: {receipt.extracted_supplier_bank_name or 'не найден'}",
-        f"МФО: {receipt.extracted_supplier_mfo or 'не найден'}",
-        f"Счет: {receipt.extracted_invoice_number or 'не найден'}",
-        f"Дата: {receipt.extracted_invoice_date or 'не найдена'}",
-        f"Сумма: {receipt.extracted_amount or 'не определена'} {receipt.extracted_currency or ''}",
+        f"Результат розпізнавання [{_mode_label()}]:",
+        f"Постачальник: {receipt.extracted_supplier_name or 'не знайдено'}",
+        f"ЄДРПОУ/ІПН: {receipt.extracted_supplier_tax_id or 'не знайдено'}",
+        f"IBAN: {receipt.extracted_supplier_iban or 'не знайдено'}",
+        f"Банк: {receipt.extracted_supplier_bank_name or 'не знайдено'}",
+        f"МФО: {receipt.extracted_supplier_mfo or 'не знайдено'}",
+        f"Рахунок: {receipt.extracted_invoice_number or 'не знайдено'}",
+        f"Дата: {receipt.extracted_invoice_date or 'не знайдено'}",
+        f"Сума: {receipt.extracted_amount or 'не визначено'} {receipt.extracted_currency or ''}",
         f"Категорія закупівлі: {PaymentPurposeBuilder.infer_category(validation_view)}",
         f"Призначення: {built_purpose}",
         f"Статус: {receipt.status.value}",
     ]
     missing_fields = receipt.validation_payload.get("missing_fields") or []
     if missing_fields:
-        lines.append(f"Отсутствует/нечитаемо: {', '.join(missing_fields)}")
+        lines.append(f"Відсутнє або нечитабельне: {', '.join(missing_fields)}")
     if preflight_errors:
-        lines.append(f"Preflight ошибки: {', '.join(preflight_errors)}")
+        lines.append(f"Помилки preflight: {', '.join(preflight_errors)}")
     return "\n".join(lines)
 
 
@@ -78,10 +78,10 @@ def register_handlers(dp: Dispatcher) -> None:
                     telegram_user_id=message.from_user.id,
                     message="Unauthorized /start attempt",
                 )
-            await message.answer("Доступ закрыт.")
+            await message.answer("Доступ заборонено.")
             return
         await message.answer(
-            f"Режим: {_mode_label()}.\nПришлите счет на оплату как фото, PDF, XLS или XLSX. Бот распарсит реквизиты, прогонит preflight-проверку, сохранит результат в БД и подготовит черновик платежа."
+            f"Режим: {_mode_label()}.\nНадішліть рахунок на оплату як фото, PDF, XLS або XLSX. Бот розпізнає реквізити, виконає preflight-перевірку, збереже результат у БД і підготує чернетку платежу."
         )
 
     @dp.message(F.photo)
@@ -94,38 +94,38 @@ def register_handlers(dp: Dispatcher) -> None:
                     telegram_user_id=message.from_user.id,
                     message="Unauthorized photo upload",
                 )
-            await message.answer("Доступ закрыт.")
+            await message.answer("Доступ заборонено.")
             return
 
-        await message.answer("Фото получено. Разбираю счет на оплату и проверяю реквизиты.")
+        await message.answer("Фото отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
         with SessionLocal() as db:
             receipt = await pipeline.handle_photo(message.bot, db, message)
 
         if receipt.status == ReceiptStatus.unreadable:
             await message.answer(
-                f"Счет не прошел проверку.\n\nПричина: {receipt.validation_summary}\n\nОтправьте более четкое фото."
+                f"Рахунок не пройшов перевірку.\n\nПричина: {receipt.validation_summary}\n\nНадішліть чіткіше фото."
             )
             return
 
         if receipt.status == ReceiptStatus.requires_manual_review:
             await message.answer(
                 _render_receipt_result(receipt)
-                + "\n\nПлатеж не создан. Документ требует ручной проверки реквизитов."
+                + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
             )
             return
 
         lines = _render_receipt_result(receipt).splitlines()
         if receipt.status == ReceiptStatus.validated:
             lines.append("")
-            lines.append("Реквизитов достаточно для распознавания, но черновик платежа пока не создан.")
+            lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
             await message.answer("\n".join(lines))
             return
 
         lines.append("")
         if receipt.status == ReceiptStatus.dry_run_created:
-            lines.append("Создан локальный dry-run черновик. В банк документ не отправлялся.")
+            lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
         else:
-            lines.append("Черновик платежа создан без подписи. Дальше его проверяет и подписывает человек.")
+            lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
         await message.answer("\n".join(lines))
 
     @dp.message(F.document)
@@ -138,44 +138,44 @@ def register_handlers(dp: Dispatcher) -> None:
                     telegram_user_id=message.from_user.id,
                     message="Unauthorized document upload",
                 )
-            await message.answer("Доступ закрыт.")
+            await message.answer("Доступ заборонено.")
             return
 
-        await message.answer("Файл получен. Разбираю счет на оплату и проверяю реквизиты.")
+        await message.answer("Файл отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
         try:
             with SessionLocal() as db:
                 receipt = await pipeline.handle_document(message.bot, db, message)
         except ValueError:
-            await message.answer("Поддерживаются только фото, PDF, XLS и XLSX.")
+            await message.answer("Підтримуються лише фото, PDF, XLS і XLSX.")
             return
 
         if receipt.status == ReceiptStatus.unreadable:
             await message.answer(
-                f"Счет не прошел проверку.\n\nПричина: {receipt.validation_summary}\n\nОтправьте более четкое изображение."
+                f"Рахунок не пройшов перевірку.\n\nПричина: {receipt.validation_summary}\n\nНадішліть чіткіше зображення."
             )
             return
 
         if receipt.status == ReceiptStatus.requires_manual_review:
             await message.answer(
                 _render_receipt_result(receipt)
-                + "\n\nПлатеж не создан. Документ требует ручной проверки реквизитов."
+                + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
             )
             return
 
         lines = _render_receipt_result(receipt).splitlines()
         if receipt.status == ReceiptStatus.validated:
             lines.append("")
-            lines.append("Реквизитов достаточно для распознавания, но черновик платежа пока не создан.")
+            lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
             await message.answer("\n".join(lines))
             return
 
         lines.append("")
         if receipt.status == ReceiptStatus.dry_run_created:
-            lines.append("Создан локальный dry-run черновик. В банк документ не отправлялся.")
+            lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
         else:
-            lines.append("Черновик платежа создан без подписи. Дальше его проверяет и подписывает человек.")
+            lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
         await message.answer("\n".join(lines))
 
     @dp.message()
     async def fallback(message: Message) -> None:
-        await message.answer("Ожидаю счет на оплату как фото, PDF, XLS или XLSX. Команда /start покажет краткую инструкцию.")
+        await message.answer("Очікую рахунок на оплату як фото, PDF, XLS або XLSX. Команда /start покаже коротку інструкцію.")

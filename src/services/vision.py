@@ -59,7 +59,7 @@ class ReceiptVisionService:
         if not self.client:
             return ReceiptValidationResult(
                 readable=False,
-                summary="Не настроен OCR/vision-провайдер. Заполните OPENAI_API_KEY.",
+                summary="OCR/vision-провайдера не налаштовано. Заповніть OPENAI_API_KEY.",
                 missing_fields=["vision_provider"],
             )
 
@@ -115,7 +115,7 @@ class ReceiptVisionService:
         if not self.client:
             return ReceiptValidationResult(
                 readable=False,
-                summary="Не настроен OCR/vision-провайдер. Заполните OPENAI_API_KEY.",
+                summary="OCR/vision-провайдера не налаштовано. Заповніть OPENAI_API_KEY.",
                 missing_fields=["vision_provider"],
             )
 
