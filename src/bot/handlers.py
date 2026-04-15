@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 from src.config import get_settings
-from src.db.models import ActionType, ReceiptStatus
+from src.db.models import ActionType, AuthorizedUser, ReceiptStatus
 from src.db.session import SessionLocal
 from src.services.audit import write_audit_log
 from src.services.purpose_builder import PaymentPurposeBuilder
@@ -18,7 +18,29 @@ pipeline = ReceiptPipeline()
 
 
 def _is_allowed(user_id: int) -> bool:
-    return not settings.allowed_user_ids or user_id in settings.allowed_user_ids
+    if settings.allowed_user_ids and user_id in settings.allowed_user_ids:
+        return True
+    if not settings.allowed_phone_numbers and not settings.allowed_user_ids:
+        return True
+    with SessionLocal() as db:
+        return db.query(AuthorizedUser).filter(AuthorizedUser.telegram_user_id == user_id).first() is not None
+
+
+def _normalize_phone(value: str) -> str:
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if digits.startswith("380") and len(digits) == 12:
+        return f"+{digits}"
+    if digits.startswith("0") and len(digits) == 10:
+        return f"+38{digits}"
+    return f"+{digits}" if digits else value.strip()
+
+
+def _contact_request_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Надіслати мій номер", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 def _mode_label() -> str:
@@ -78,10 +100,61 @@ def register_handlers(dp: Dispatcher) -> None:
                     telegram_user_id=message.from_user.id,
                     message="Unauthorized /start attempt",
                 )
-            await message.answer("Доступ заборонено.")
+            await message.answer(
+                "Доступ до бота дозволено лише для авторизованих номерів. Надішліть свій контакт кнопкою нижче.",
+                reply_markup=_contact_request_keyboard(),
+            )
             return
         await message.answer(
-            f"Режим: {_mode_label()}.\nНадішліть рахунок на оплату як фото, PDF, XLS або XLSX. Бот розпізнає реквізити, виконає preflight-перевірку, збереже результат у БД і підготує чернетку платежу."
+            f"Режим: {_mode_label()}.\nНадішліть рахунок на оплату як фото, PDF, XLS або XLSX. Бот розпізнає реквізити, виконає preflight-перевірку, збереже результат у БД і підготує чернетку платежу.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    @dp.message(F.contact)
+    async def handle_contact(message: Message) -> None:
+        contact = message.contact
+        if not contact:
+            return
+        if contact.user_id and contact.user_id != message.from_user.id:
+            await message.answer(
+                "Потрібно надіслати саме свій контакт через кнопку Telegram.",
+                reply_markup=_contact_request_keyboard(),
+            )
+            return
+
+        normalized_phone = _normalize_phone(contact.phone_number)
+        if normalized_phone not in settings.allowed_phone_numbers:
+            with SessionLocal() as db:
+                write_audit_log(
+                    db,
+                    action_type=ActionType.access_denied,
+                    telegram_user_id=message.from_user.id,
+                    message="Unauthorized phone contact",
+                    payload={"phone_number": normalized_phone},
+                )
+            await message.answer("Цей номер не має доступу до бота.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        with SessionLocal() as db:
+            existing = db.query(AuthorizedUser).filter(AuthorizedUser.telegram_user_id == message.from_user.id).first()
+            if existing:
+                existing.telegram_chat_id = message.chat.id
+                existing.phone_number = normalized_phone
+                db.add(existing)
+                db.commit()
+            else:
+                db.add(
+                    AuthorizedUser(
+                        telegram_user_id=message.from_user.id,
+                        telegram_chat_id=message.chat.id,
+                        phone_number=normalized_phone,
+                    )
+                )
+                db.commit()
+
+        await message.answer(
+            f"Доступ підтверджено для номера {normalized_phone}.\nНадішліть рахунок на оплату як фото, PDF, XLS або XLSX.",
+            reply_markup=ReplyKeyboardRemove(),
         )
 
     @dp.message(F.photo)
@@ -94,7 +167,10 @@ def register_handlers(dp: Dispatcher) -> None:
                     telegram_user_id=message.from_user.id,
                     message="Unauthorized photo upload",
                 )
-            await message.answer("Доступ заборонено.")
+            await message.answer(
+                "Доступ заборонено. Спочатку підтвердьте номер телефону через /start.",
+                reply_markup=_contact_request_keyboard(),
+            )
             return
 
         await message.answer("Фото отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
@@ -138,7 +214,10 @@ def register_handlers(dp: Dispatcher) -> None:
                     telegram_user_id=message.from_user.id,
                     message="Unauthorized document upload",
                 )
-            await message.answer("Доступ заборонено.")
+            await message.answer(
+                "Доступ заборонено. Спочатку підтвердьте номер телефону через /start.",
+                reply_markup=_contact_request_keyboard(),
+            )
             return
 
         await message.answer("Файл отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
@@ -178,4 +257,10 @@ def register_handlers(dp: Dispatcher) -> None:
 
     @dp.message()
     async def fallback(message: Message) -> None:
+        if not _is_allowed(message.from_user.id):
+            await message.answer(
+                "Щоб користуватися ботом, підтвердьте свій номер телефону через /start.",
+                reply_markup=_contact_request_keyboard(),
+            )
+            return
         await message.answer("Очікую рахунок на оплату як фото, PDF, XLS або XLSX. Команда /start покаже коротку інструкцію.")

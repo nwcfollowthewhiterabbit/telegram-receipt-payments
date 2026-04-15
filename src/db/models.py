@@ -100,3 +100,16 @@ class AuditLog(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
     receipt: Mapped[Receipt | None] = relationship(back_populates="audit_logs")
+
+
+class AuthorizedUser(Base):
+    __tablename__ = "authorized_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    telegram_chat_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    phone_number: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
+    )

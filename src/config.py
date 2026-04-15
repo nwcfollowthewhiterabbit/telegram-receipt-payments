@@ -29,6 +29,29 @@ def _parse_int_list(value: str | None) -> list[int]:
     return result
 
 
+def _normalize_phone(value: str) -> str:
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if digits.startswith("380") and len(digits) == 12:
+        return f"+{digits}"
+    if digits.startswith("0") and len(digits) == 10:
+        return f"+38{digits}"
+    if value.strip().startswith("+") and digits:
+        return f"+{digits}"
+    return f"+{digits}" if digits else value.strip()
+
+
+def _parse_phone_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    result: list[str] = []
+    for chunk in value.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        result.append(_normalize_phone(chunk))
+    return result
+
+
 def _env_or_default(name: str, default: str) -> str:
     value = os.getenv(name)
     if value is None:
@@ -46,6 +69,7 @@ class Settings:
         default_factory=lambda: os.getenv("DATABASE_URL", "postgresql+psycopg://receiptbot:receiptbot@db:5432/receiptbot")
     )
     allowed_user_ids: list[int] = field(default_factory=lambda: _parse_int_list(os.getenv("ALLOWED_USER_IDS")))
+    allowed_phone_numbers: list[str] = field(default_factory=lambda: _parse_phone_list(os.getenv("ALLOWED_PHONE_NUMBERS")))
     receipt_storage_dir: str = field(default_factory=lambda: os.getenv("RECEIPT_STORAGE_DIR", "/app/data/receipts"))
     privat24_api_base_url: str = field(default_factory=lambda: _env_or_default("PRIVAT24_API_BASE_URL", "https://acp.privatbank.ua"))
     privat24_api_token: str = field(default_factory=lambda: os.getenv("PRIVAT24_API_TOKEN", ""))
