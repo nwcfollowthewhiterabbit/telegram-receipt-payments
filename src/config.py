@@ -81,6 +81,15 @@ class Settings:
         default_factory=lambda: _env_or_default("PRIVAT24_PAYMENT_ACCEPT_DATE", dt.date.today().strftime("%d.%m.%Y"))
     )
     privat24_dry_run: bool = field(default_factory=lambda: _parse_bool(os.getenv("PRIVAT24_DRY_RUN"), True))
+    privat24_receipt_poll_seconds: int = field(
+        default_factory=lambda: int(_env_or_default("PRIVAT24_RECEIPT_POLL_SECONDS", "60"))
+    )
+    privat24_receipt_lookback_days: int = field(
+        default_factory=lambda: int(_env_or_default("PRIVAT24_RECEIPT_LOOKBACK_DAYS", "3"))
+    )
+    privat24_receipt_notify_phone: str = field(
+        default_factory=lambda: _normalize_phone(os.getenv("PRIVAT24_RECEIPT_NOTIFY_PHONE", ""))
+    )
     company_name: str = field(default_factory=lambda: os.getenv("COMPANY_NAME", ""))
     default_currency: str = field(default_factory=lambda: os.getenv("DEFAULT_CURRENCY", "UAH"))
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
 from decimal import Decimal
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -109,3 +111,63 @@ class Privat24Client:
         )
         response.raise_for_status()
         return response.json()
+
+    def get_transactions(
+        self,
+        account: str,
+        start_date: dt.date,
+        end_date: dt.date | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "acc": account,
+            "startDate": start_date.strftime("%d-%m-%Y"),
+            "limit": min(limit, 100),
+        }
+        if end_date:
+            params["endDate"] = end_date.strftime("%d-%m-%Y")
+
+        items: list[dict[str, Any]] = []
+        follow_id: str | None = None
+        while True:
+            current_params = dict(params)
+            if follow_id:
+                current_params["followId"] = follow_id
+            response = httpx.get(
+                f"{self.settings.privat24_api_base_url.rstrip('/')}/api/statements/transactions",
+                params=current_params,
+                headers=self._headers(),
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            chunk = data.get("transactions") or data.get("list") or data.get("data") or []
+            if isinstance(chunk, list):
+                items.extend(chunk)
+            follow_id = data.get("followId") or data.get("follow_id")
+            if not follow_id or not chunk:
+                break
+        return items
+
+    def print_receipt(self, account: str, reference: str, refn: str, per_page: int = 4) -> tuple[str, bytes]:
+        response = httpx.post(
+            f"{self.settings.privat24_api_base_url.rstrip('/')}/api/paysheets/print_receipt",
+            json={
+                "transactions": [
+                    {
+                        "account": account,
+                        "reference": reference,
+                        "refn": refn,
+                    }
+                ],
+                "perPage": per_page,
+            },
+            headers={**self._headers(), "Accept": "application/octet-stream"},
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        filename = f"receipt_{account}_{reference}.pdf"
+        content_disposition = response.headers.get("content-disposition", "")
+        if "filename=" in content_disposition:
+            filename = content_disposition.split("filename=", 1)[1].strip().strip('"')
+        return filename, response.content
