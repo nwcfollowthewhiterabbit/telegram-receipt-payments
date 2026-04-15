@@ -9,7 +9,7 @@ from src.db.models import ActionType, AuthorizedUser, ReceiptStatus
 from src.db.session import SessionLocal
 from src.services.audit import write_audit_log
 from src.services.purpose_builder import PaymentPurposeBuilder
-from src.services.receipt_pipeline import ProcessedReceipt, ReceiptPipeline
+from src.services.receipt_pipeline import ReceiptPipeline
 from src.services.schemas import ReceiptValidationResult
 
 
@@ -98,11 +98,7 @@ def _render_receipt_result(receipt) -> str:
     return "\n".join(lines)
 
 
-def _render_receipt_response(result: ProcessedReceipt) -> str:
-    receipt = result.receipt
-    if result.duplicate and result.duplicate_status_message:
-        return _render_receipt_result(receipt) + "\n\n" + result.duplicate_status_message
-
+def _render_receipt_response(receipt) -> str:
     if receipt.status == ReceiptStatus.requires_manual_review:
         return _render_receipt_result(receipt) + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
 
@@ -203,8 +199,7 @@ def register_handlers(dp: Dispatcher) -> None:
 
         await message.answer("Фото отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
         with SessionLocal() as db:
-            result = await pipeline.handle_photo(message.bot, db, message)
-            receipt = result.receipt
+            receipt = await pipeline.handle_photo(message.bot, db, message)
 
         if receipt.status == ReceiptStatus.unreadable:
             await message.answer(
@@ -212,7 +207,7 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
 
-        await message.answer(_render_receipt_response(result))
+        await message.answer(_render_receipt_response(receipt))
 
     @dp.message(F.document)
     async def handle_document(message: Message) -> None:
@@ -233,8 +228,7 @@ def register_handlers(dp: Dispatcher) -> None:
         await message.answer("Файл отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
         try:
             with SessionLocal() as db:
-                result = await pipeline.handle_document(message.bot, db, message)
-                receipt = result.receipt
+                receipt = await pipeline.handle_document(message.bot, db, message)
         except ValueError:
             await message.answer("Підтримуються лише фото, PDF, XLS і XLSX.")
             return
@@ -245,7 +239,7 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
 
-        await message.answer(_render_receipt_response(result))
+        await message.answer(_render_receipt_response(receipt))
 
     @dp.message()
     async def fallback(message: Message) -> None:
