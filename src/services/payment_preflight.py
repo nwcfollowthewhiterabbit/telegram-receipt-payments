@@ -32,6 +32,22 @@ def normalize_text(value: str | None) -> str | None:
     return value or None
 
 
+def extract_company_tax_id(raw_text: str | None) -> str | None:
+    if not raw_text:
+        return None
+
+    patterns = [
+        r"код\s+за\s+єдрпоу\s*[:№]?\s*(\d{8})",
+        r"\bєдрпоу\s*[:№]?\s*(\d{8})",
+        r"\bкод\s*[:№]?\s*(\d{8})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw_text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
 @dataclass(slots=True)
 class PreflightResult:
     ok: bool
@@ -49,6 +65,10 @@ def run_preflight(validation: ReceiptValidationResult, purpose: str) -> Prefligh
     supplier_iban = normalize_iban(validation.supplier_iban)
     supplier_bank_name = normalize_text(validation.supplier_bank_name)
     normalized_purpose = normalize_text(purpose)
+    company_tax_id = extract_company_tax_id(validation.raw_text)
+
+    if company_tax_id:
+        supplier_tax_id = company_tax_id
 
     errors: list[str] = []
 

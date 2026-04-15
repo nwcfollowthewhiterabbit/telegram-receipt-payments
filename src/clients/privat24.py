@@ -83,7 +83,14 @@ class Privat24Client:
             headers=self._headers(),
             timeout=30.0,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            response_text = exc.response.text.strip()
+            message = f"Privat24 create failed with status {exc.response.status_code}"
+            if response_text:
+                message = f"{message}: {response_text}"
+            raise RuntimeError(message) from exc
         data = response.json()
         return PaymentDraftResult(
             created=True,

@@ -36,7 +36,7 @@ class ReceiptPipeline:
 
     @staticmethod
     def _document_number(receipt_id: int) -> str:
-        return f"RCPT{receipt_id:08d}"
+        return f"RCPT{receipt_id:04d}"
 
     async def handle_photo(self, bot: Bot, db: Session, message: Message) -> Receipt:
         photo = message.photo[-1]
@@ -209,17 +209,40 @@ class ReceiptPipeline:
                 "execution_mode": "dry_run" if self.settings.privat24_dry_run else "live",
             },
         )
-        draft_result = self.privat24.create_payment_draft(
-            document_number=self._document_number(receipt.id),
-            beneficiary_name=preflight.normalized_supplier_name,
-            beneficiary_tax_id=preflight.normalized_supplier_tax_id,
-            beneficiary_iban=preflight.normalized_supplier_iban,
-            beneficiary_bank_name=preflight.normalized_supplier_bank_name,
-            beneficiary_mfo=validation.supplier_mfo,
-            amount=validation.amount,
-            currency=validation.currency or self.settings.default_currency,
-            purpose=preflight.normalized_purpose,
-        )
+        try:
+            draft_result = self.privat24.create_payment_draft(
+                document_number=self._document_number(receipt.id),
+                beneficiary_name=preflight.normalized_supplier_name,
+                beneficiary_tax_id=preflight.normalized_supplier_tax_id,
+                beneficiary_iban=preflight.normalized_supplier_iban,
+                beneficiary_bank_name=preflight.normalized_supplier_bank_name,
+                beneficiary_mfo=validation.supplier_mfo,
+                amount=validation.amount,
+                currency=validation.currency or self.settings.default_currency,
+                purpose=preflight.normalized_purpose,
+            )
+        except Exception as exc:
+            receipt.status = ReceiptStatus.payment_draft_failed
+            receipt.validation_payload = {
+                **receipt.validation_payload,
+                "payment_create_error": str(exc),
+            }
+            db.add(receipt)
+            db.commit()
+            write_audit_log(
+                db,
+                action_type=ActionType.payment_draft_failed,
+                telegram_user_id=telegram_user_id,
+                receipt_id=receipt.id,
+                message="Payment draft creation failed",
+                payload={
+                    "error": str(exc),
+                    "document_number": self._document_number(receipt.id),
+                    "beneficiary_tax_id": preflight.normalized_supplier_tax_id,
+                    "beneficiary_iban": preflight.normalized_supplier_iban,
+                },
+            )
+            return receipt
 
         payment_draft = PaymentDraft(
             receipt_id=receipt.id,
