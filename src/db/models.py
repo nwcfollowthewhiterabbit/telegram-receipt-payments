@@ -39,7 +39,7 @@ class Receipt(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     telegram_user_id: Mapped[int] = mapped_column(Integer, index=True)
     telegram_chat_id: Mapped[int] = mapped_column(Integer, index=True)
-    telegram_file_id: Mapped[str] = mapped_column(String(255))
+    telegram_file_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     original_filename: Mapped[str] = mapped_column(String(255))
     storage_path: Mapped[str] = mapped_column(String(512))
     mime_type: Mapped[str] = mapped_column(String(64), default="image/jpeg")

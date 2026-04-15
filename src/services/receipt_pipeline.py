@@ -34,6 +34,10 @@ class ReceiptPipeline:
             and validation.currency
         )
 
+    @staticmethod
+    def _document_number(receipt_id: int) -> str:
+        return f"RCPT{receipt_id:08d}"
+
     async def handle_photo(self, bot: Bot, db: Session, message: Message) -> Receipt:
         photo = message.photo[-1]
         telegram_file = await bot.get_file(photo.file_id)
@@ -109,6 +113,10 @@ class ReceiptPipeline:
         storage_path: Path,
         mime_type: str,
     ) -> Receipt:
+        existing = db.query(Receipt).filter(Receipt.telegram_file_id == telegram_file_id).first()
+        if existing:
+            return existing
+
         receipt = Receipt(
             telegram_user_id=telegram_user_id,
             telegram_chat_id=telegram_chat_id,
@@ -202,6 +210,7 @@ class ReceiptPipeline:
             },
         )
         draft_result = self.privat24.create_payment_draft(
+            document_number=self._document_number(receipt.id),
             beneficiary_name=preflight.normalized_supplier_name,
             beneficiary_tax_id=preflight.normalized_supplier_tax_id,
             beneficiary_iban=preflight.normalized_supplier_iban,

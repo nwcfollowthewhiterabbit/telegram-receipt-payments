@@ -34,6 +34,7 @@ class Privat24Client:
 
     def create_payment_draft(
         self,
+        document_number: str,
         beneficiary_name: str,
         beneficiary_tax_id: str | None,
         beneficiary_iban: str | None,
@@ -48,7 +49,7 @@ class Privat24Client:
         beneficiary_bank_name = normalize_text(beneficiary_bank_name)
         purpose = normalize_text(purpose) or ""
         payload = {
-            "document_number": f"INV{uuid4().hex[:10].upper()}",
+            "document_number": document_number,
             "payer_account": self.settings.privat24_source_account,
             "recipient_account": beneficiary_iban,
             "recipient_nceo": self.normalize_nceo(beneficiary_tax_id),
