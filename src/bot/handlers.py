@@ -9,7 +9,7 @@ from src.db.models import ActionType, AuthorizedUser, ReceiptStatus
 from src.db.session import SessionLocal
 from src.services.audit import write_audit_log
 from src.services.purpose_builder import PaymentPurposeBuilder
-from src.services.receipt_pipeline import ReceiptPipeline
+from src.services.receipt_pipeline import ProcessedReceipt, ReceiptPipeline
 from src.services.schemas import ReceiptValidationResult
 
 
@@ -47,6 +47,15 @@ def _mode_label() -> str:
     return "DRY RUN" if settings.privat24_dry_run else "LIVE"
 
 
+def _receipt_mode_label(receipt) -> str:
+    execution_mode = (receipt.validation_payload or {}).get("execution_mode")
+    if execution_mode == "dry_run":
+        return "DRY RUN"
+    if execution_mode == "live":
+        return "LIVE"
+    return _mode_label()
+
+
 def _render_receipt_result(receipt) -> str:
     validation_view = ReceiptValidationResult(
         readable=True,
@@ -68,7 +77,7 @@ def _render_receipt_result(receipt) -> str:
     built_purpose = PaymentPurposeBuilder.build(validation_view)
     preflight_errors = receipt.validation_payload.get("preflight_errors") or []
     lines = [
-        f"Результат розпізнавання [{_mode_label()}]:",
+        f"Результат розпізнавання [{_receipt_mode_label(receipt)}]:",
         f"Постачальник: {receipt.extracted_supplier_name or 'не знайдено'}",
         f"ЄДРПОУ/ІПН: {receipt.extracted_supplier_tax_id or 'не знайдено'}",
         f"IBAN: {receipt.extracted_supplier_iban or 'не знайдено'}",
@@ -86,6 +95,25 @@ def _render_receipt_result(receipt) -> str:
         lines.append(f"Відсутнє або нечитабельне: {', '.join(missing_fields)}")
     if preflight_errors:
         lines.append(f"Помилки preflight: {', '.join(preflight_errors)}")
+    return "\n".join(lines)
+
+
+def _render_receipt_response(result: ProcessedReceipt) -> str:
+    receipt = result.receipt
+    if result.duplicate and result.duplicate_status_message:
+        return _render_receipt_result(receipt) + "\n\n" + result.duplicate_status_message
+
+    if receipt.status == ReceiptStatus.requires_manual_review:
+        return _render_receipt_result(receipt) + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
+
+    lines = _render_receipt_result(receipt).splitlines()
+    lines.append("")
+    if receipt.status == ReceiptStatus.validated:
+        lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
+    elif receipt.status == ReceiptStatus.dry_run_created:
+        lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
+    else:
+        lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
     return "\n".join(lines)
 
 
@@ -175,7 +203,8 @@ def register_handlers(dp: Dispatcher) -> None:
 
         await message.answer("Фото отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
         with SessionLocal() as db:
-            receipt = await pipeline.handle_photo(message.bot, db, message)
+            result = await pipeline.handle_photo(message.bot, db, message)
+            receipt = result.receipt
 
         if receipt.status == ReceiptStatus.unreadable:
             await message.answer(
@@ -183,26 +212,7 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
 
-        if receipt.status == ReceiptStatus.requires_manual_review:
-            await message.answer(
-                _render_receipt_result(receipt)
-                + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
-            )
-            return
-
-        lines = _render_receipt_result(receipt).splitlines()
-        if receipt.status == ReceiptStatus.validated:
-            lines.append("")
-            lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
-            await message.answer("\n".join(lines))
-            return
-
-        lines.append("")
-        if receipt.status == ReceiptStatus.dry_run_created:
-            lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
-        else:
-            lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
-        await message.answer("\n".join(lines))
+        await message.answer(_render_receipt_response(result))
 
     @dp.message(F.document)
     async def handle_document(message: Message) -> None:
@@ -223,7 +233,8 @@ def register_handlers(dp: Dispatcher) -> None:
         await message.answer("Файл отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
         try:
             with SessionLocal() as db:
-                receipt = await pipeline.handle_document(message.bot, db, message)
+                result = await pipeline.handle_document(message.bot, db, message)
+                receipt = result.receipt
         except ValueError:
             await message.answer("Підтримуються лише фото, PDF, XLS і XLSX.")
             return
@@ -234,26 +245,7 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
 
-        if receipt.status == ReceiptStatus.requires_manual_review:
-            await message.answer(
-                _render_receipt_result(receipt)
-                + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
-            )
-            return
-
-        lines = _render_receipt_result(receipt).splitlines()
-        if receipt.status == ReceiptStatus.validated:
-            lines.append("")
-            lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
-            await message.answer("\n".join(lines))
-            return
-
-        lines.append("")
-        if receipt.status == ReceiptStatus.dry_run_created:
-            lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
-        else:
-            lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
-        await message.answer("\n".join(lines))
+        await message.answer(_render_receipt_response(result))
 
     @dp.message()
     async def fallback(message: Message) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot
@@ -15,6 +16,13 @@ from .payment_preflight import run_preflight
 from .purpose_builder import PaymentPurposeBuilder
 from .schemas import ReceiptValidationResult
 from .vision import ReceiptVisionService
+
+
+@dataclass(slots=True)
+class ProcessedReceipt:
+    receipt: Receipt
+    duplicate: bool = False
+    duplicate_status_message: str | None = None
 
 
 class ReceiptPipeline:
@@ -38,7 +46,7 @@ class ReceiptPipeline:
     def _document_number(receipt_id: int) -> str:
         return f"RCPT{receipt_id:04d}"
 
-    async def handle_photo(self, bot: Bot, db: Session, message: Message) -> Receipt:
+    async def handle_photo(self, bot: Bot, db: Session, message: Message) -> ProcessedReceipt:
         photo = message.photo[-1]
         telegram_file = await bot.get_file(photo.file_id)
         target_dir = Path(self.settings.receipt_storage_dir)
@@ -55,7 +63,7 @@ class ReceiptPipeline:
             mime_type="image/jpeg",
         )
 
-    async def handle_document(self, bot: Bot, db: Session, message: Message) -> Receipt:
+    async def handle_document(self, bot: Bot, db: Session, message: Message) -> ProcessedReceipt:
         document = message.document
         mime_type = document.mime_type or ""
         extension = Path(document.file_name or "invoice.bin").suffix.lower()
@@ -80,7 +88,7 @@ class ReceiptPipeline:
             mime_type=mime_type,
         )
 
-    def process_local_file(self, db: Session, file_path: str) -> Receipt:
+    def process_local_file(self, db: Session, file_path: str) -> ProcessedReceipt:
         source = Path(file_path)
         extension = source.suffix.lower()
         if extension in {".jpg", ".jpeg", ".png", ".webp"}:
@@ -112,10 +120,14 @@ class ReceiptPipeline:
         original_filename: str,
         storage_path: Path,
         mime_type: str,
-    ) -> Receipt:
+    ) -> ProcessedReceipt:
         existing = db.query(Receipt).filter(Receipt.telegram_file_id == telegram_file_id).first()
         if existing:
-            return existing
+            return ProcessedReceipt(
+                receipt=existing,
+                duplicate=True,
+                duplicate_status_message=self._build_duplicate_status_message(db, existing),
+            )
 
         receipt = Receipt(
             telegram_user_id=telegram_user_id,
@@ -165,7 +177,7 @@ class ReceiptPipeline:
         )
 
         if not self._has_required_invoice_fields(validation):
-            return receipt
+            return ProcessedReceipt(receipt=receipt)
 
         purpose = PaymentPurposeBuilder.build(validation)
         preflight = run_preflight(validation, purpose)
@@ -195,7 +207,7 @@ class ReceiptPipeline:
                 message="Payment preflight validation failed",
                 payload={"errors": preflight.errors},
             )
-            return receipt
+            return ProcessedReceipt(receipt=receipt)
 
         write_audit_log(
             db,
@@ -242,7 +254,7 @@ class ReceiptPipeline:
                     "beneficiary_iban": preflight.normalized_supplier_iban,
                 },
             )
-            return receipt
+            return ProcessedReceipt(receipt=receipt)
 
         payment_draft = PaymentDraft(
             receipt_id=receipt.id,
@@ -277,7 +289,52 @@ class ReceiptPipeline:
             message="Payment draft processed",
             payload=draft_result.model_dump(mode="json"),
         )
-        return receipt
+        return ProcessedReceipt(receipt=receipt)
+
+    def _build_duplicate_status_message(self, db: Session, receipt: Receipt) -> str:
+        latest_draft = (
+            db.query(PaymentDraft)
+            .filter(PaymentDraft.receipt_id == receipt.id)
+            .order_by(PaymentDraft.id.desc())
+            .first()
+        )
+        processed_at = receipt.created_at.strftime("%d.%m.%Y %H:%M UTC")
+        prefix = f"Цей файл уже оброблявся раніше: {processed_at}."
+        if not latest_draft:
+            return prefix
+
+        provider_payload = latest_draft.provider_payload or {}
+        delivery = provider_payload.get("receipt_delivery") or {}
+        if delivery.get("sent_to"):
+            return (
+                f"{prefix}\n"
+                "Платіж за цим рахунком уже проведено, а банківську квитанцію вже відправлено отримувачам."
+            )
+
+        if str(latest_draft.provider_payment_id or "").startswith("dry-run-") or latest_draft.status == "draft_created_dry_run":
+            return (
+                f"{prefix}\n"
+                "Для цього файлу раніше було створено лише dry-run чернетку. До банку документ тоді не надсилався."
+            )
+
+        if latest_draft.provider_payment_id:
+            try:
+                payment = self.privat24.get_payment(latest_draft.provider_payment_id)
+            except Exception:
+                payment = {}
+            payment_status = str(payment.get("payment_status") or latest_draft.status or "").strip()
+            if payment_status == "new":
+                return (
+                    f"{prefix}\n"
+                    "Чернетку платежу вже створено в Privat24. Вона очікує підпису оператора."
+                )
+            if payment_status:
+                return (
+                    f"{prefix}\n"
+                    f"Платіж за цим рахунком уже існує в Privat24. Поточний статус: {payment_status}."
+                )
+
+        return f"{prefix}\nЧернетку для цього рахунку вже створювали раніше."
 
     def _validate_saved_file(self, storage_path: Path, mime_type: str, original_filename: str) -> ReceiptValidationResult:
         extension = storage_path.suffix.lower()
