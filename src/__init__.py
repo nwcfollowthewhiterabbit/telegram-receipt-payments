@@ -1,0 +1,1 @@
+"""Receipt pay bot package."""
