@@ -29,3 +29,11 @@ class PaymentDraftResult(BaseModel):
     provider_pack_id: str | None = None
     status: str
     payload: dict = Field(default_factory=dict)
+
+
+class CrmSyncResult(BaseModel):
+    synced: bool
+    provider_name: str
+    external_id: str | None = None
+    status: str
+    payload: dict = Field(default_factory=dict)

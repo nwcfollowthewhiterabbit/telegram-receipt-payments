@@ -4,7 +4,7 @@ Docker-проект для Telegram-бота, который:
 
 - принимает от сотрудников фото счетов на оплату;
 - проверяет, достаточно ли читаются реквизиты для создания платежки;
-- если все ок, создает черновик платежки в `Приват24 для бизнеса`;
+- если все ок, создает черновик платежки в выбранном банке (`Приват24 для бизнеса` или monobank corp API);
 - не подписывает платеж;
 - пишет аудит всех действий в собственную PostgreSQL-базу.
 
@@ -15,7 +15,8 @@ Docker-проект для Telegram-бота, который:
 - Сохранение изображений в volume.
 - Vision/OCR-проверка счета на оплату через OpenAI Responses API.
 - Автоматический переход к созданию черновика платежа.
-- Dry-run режим для `Privat24`, чтобы можно было поднять проект до подключения реального API банка.
+- Dry-run режим для банковских адаптеров, чтобы можно было поднять проект до подключения реального API банка.
+- Connector-слой для банков, CRM и Telegram-границы бота.
 - Белый список `ALLOWED_USER_IDS`.
 
 ## Что именно проверяет текущий MVP
@@ -43,7 +44,11 @@ Docker-проект для Telegram-бота, который:
 
 ## Ограничение текущего MVP
 
-Интеграция с `Приват24` переведена на официальный `Автоклієнт API`. Для гривневого платежа используется `POST https://acp.privatbank.ua/api/proxy/payment/create`, а подпись идет отдельным шагом через `GET /api/proxy/payment/get` и `POST /api/proxy/payment/add-sign`.
+Интеграция с банками вынесена в отдельные адаптеры и выбирается через `PAYMENT_PROVIDER`.
+
+Для `Privat24` используется официальный `Автоклієнт API`: `POST https://acp.privatbank.ua/api/proxy/payment/create`, а подпись идет отдельным шагом через `GET /api/proxy/payment/get` и `POST /api/proxy/payment/add-sign`.
+
+Для `monobank` используется корпоративный API: `POST https://corp-api.monobank.ua/ext/v1/payment/prepare`. Запрос создает черновик платежа без подписи и возвращает `id`.
 
 Официальные источники:
 
@@ -51,7 +56,14 @@ Docker-проект для Telegram-бота, который:
 - https://api.privatbank.ua/index.html
 - https://docs.google.com/document/d/e/2PACX-1vTtKvGa3P4E-lDqLg3bHRF6Wi9S7GIjSMFEFxII5qQZBGxuTXs25hQNiUU1hMZQhOyx6BNvIZ1bVKSr/pub
 
-Поэтому в проекте адаптер вынесен отдельно в [src/clients/privat24.py](/home/wroot/receipt-paybot/src/clients/privat24.py:1), а по умолчанию для безопасности оставлен `PRIVAT24_DRY_RUN=true`.
+Поэтому в проекте банковская логика вынесена отдельно в [src/clients/privat24.py](/home/wroot/receipt-paybot/src/clients/privat24.py:1) и [src/clients/monobank.py](/home/wroot/receipt-paybot/src/clients/monobank.py:1). По умолчанию для безопасности оставлены dry-run режимы.
+
+CRM-интеграция выбирается через `CRM_PROVIDER`. Сейчас доступны:
+
+- `none` — CRM отключена.
+- `terrasoft_mssql` — запись распознанного счета и банковского черновика в Terrasoft/XRM v3 через MS SQL.
+
+Для Terrasoft live-режима нужны `TERRASOFT_MSSQL_URL` и `TERRASOFT_INVOICE_TABLE`. До согласования точной таблицы и колонок держите `CRM_DRY_RUN=true`: бот сохранит в аудит payload, который ушел бы в CRM.
 
 ## Быстрый старт
 
@@ -66,6 +78,7 @@ cp .env.example .env
 - `TELEGRAM_BOT_TOKEN`
 - `OPENAI_API_KEY`
 - `ALLOWED_USER_IDS`
+- `PAYMENT_PROVIDER` (`privat24` или `monobank`)
 - `PRIVAT24_API_BASE_URL`
 - `PRIVAT24_API_TOKEN`
 - `PRIVAT24_SOURCE_ACCOUNT`
@@ -113,20 +126,36 @@ python3 -m scripts.test_invoice_parsing /path/to/invoices
 - `ALLOWED_USER_IDS` — список Telegram user id через запятую.
 - `DATABASE_URL` — строка подключения к PostgreSQL.
 - `RECEIPT_STORAGE_DIR` — директория хранения изображений.
+- `PAYMENT_PROVIDER` — активный банковский адаптер: `privat24` или `monobank`.
+- `PAYMENT_DRY_RUN` — общий override dry-run режима; если пустой, используется настройка выбранного провайдера.
 - `PRIVAT24_API_BASE_URL` — базовый URL API банка.
 - `PRIVAT24_API_TOKEN` — токен интеграции.
 - `PRIVAT24_SOURCE_ACCOUNT` — счет списания.
 - `PRIVAT24_PAYMENT_DATE` — дата списания в формате `DD.MM.YYYY`.
 - `PRIVAT24_PAYMENT_ACCEPT_DATE` — дата зачисления/валютирования в формате `DD.MM.YYYY`.
 - `PRIVAT24_DRY_RUN` — если `true`, вместо реального запроса создается локальный черновик-имитация.
+- `MONOBANK_API_BASE_URL` — базовый URL корпоративного API monobank.
+- `MONOBANK_API_TOKEN` — токен корпоративного API monobank.
+- `MONOBANK_SOURCE_IBAN` — IBAN счета списания; если пустой, бот попробует получить гривневый счет через `/ext/v1/accounts`.
+- `MONOBANK_DRY_RUN` — если `true`, вместо реального запроса создается локальный черновик-имитация.
+- `CRM_PROVIDER` — активный CRM-коннектор: `none` или `terrasoft_mssql`.
+- `CRM_DRY_RUN` — если `true`, CRM-коннектор не пишет в CRM, а возвращает payload для аудита.
+- `TERRASOFT_MSSQL_URL` — SQLAlchemy URL подключения, например `mssql+pymssql://user:pass@host:1433/dbname`.
+- `TERRASOFT_INVOICE_TABLE` — таблица Terrasoft для счетов, например `dbo.UsrReceiptInvoice`.
+- `TERRASOFT_COLUMN_MAP` — JSON-маппинг внутренних полей на колонки Terrasoft, если стандартные `Usr...` имена отличаются.
 
 ## Структура
 
+- [docs/ARCHITECTURE_ROADMAP.md](/home/wroot/receipt-paybot/docs/ARCHITECTURE_ROADMAP.md:1) — архитектурный регламент, roadmap и вопросы для финализации требований.
 - [src/main.py](/home/wroot/receipt-paybot/src/main.py:1) — точка входа.
 - [src/bot/handlers.py](/home/wroot/receipt-paybot/src/bot/handlers.py:1) — Telegram-обработчики.
 - [src/services/receipt_pipeline.py](/home/wroot/receipt-paybot/src/services/receipt_pipeline.py:1) — пайплайн счета на оплату.
+- [src/connectors/payments/registry.py](/home/wroot/receipt-paybot/src/connectors/payments/registry.py:1) — выбор платежного коннектора.
+- [src/connectors/crm/registry.py](/home/wroot/receipt-paybot/src/connectors/crm/registry.py:1) — выбор CRM-коннектора.
 - [src/services/vision.py](/home/wroot/receipt-paybot/src/services/vision.py:1) — OCR/vision-валидация счета.
-- [src/clients/privat24.py](/home/wroot/receipt-paybot/src/clients/privat24.py:1) — адаптер банка.
+- [src/clients/privat24.py](/home/wroot/receipt-paybot/src/clients/privat24.py:1) — адаптер Privat24.
+- [src/clients/monobank.py](/home/wroot/receipt-paybot/src/clients/monobank.py:1) — адаптер monobank.
+- [src/connectors/crm/terrasoft_mssql.py](/home/wroot/receipt-paybot/src/connectors/crm/terrasoft_mssql.py:1) — адаптер Terrasoft/XRM v3 через MS SQL.
 - [src/db/models.py](/home/wroot/receipt-paybot/src/db/models.py:1) — модели БД.
 
 ## Что я бы сделал следующим шагом

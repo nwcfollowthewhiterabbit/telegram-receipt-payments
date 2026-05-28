@@ -53,6 +53,8 @@ class PaymentReceiptMonitor:
             await asyncio.sleep(max(30, self.settings.privat24_receipt_poll_seconds))
 
     def _collect_jobs(self) -> list[ReceiptNotificationJob]:
+        if self.settings.payment_provider != "privat24":
+            return []
         if self.settings.privat24_dry_run or not self.settings.privat24_api_token:
             return []
 

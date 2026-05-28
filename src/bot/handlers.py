@@ -44,15 +44,18 @@ def _contact_request_keyboard() -> ReplyKeyboardMarkup:
 
 
 def _mode_label() -> str:
-    return "DRY RUN" if settings.privat24_dry_run else "LIVE"
+    mode = "DRY RUN" if settings.payment_dry_run else "LIVE"
+    return f"{settings.payment_provider.upper()} / {mode}"
 
 
 def _receipt_mode_label(receipt) -> str:
-    execution_mode = (receipt.validation_payload or {}).get("execution_mode")
+    payload = receipt.validation_payload or {}
+    provider = (payload.get("payment_provider") or settings.payment_provider).upper()
+    execution_mode = payload.get("execution_mode")
     if execution_mode == "dry_run":
-        return "DRY RUN"
+        return f"{provider} / DRY RUN"
     if execution_mode == "live":
-        return "LIVE"
+        return f"{provider} / LIVE"
     return _mode_label()
 
 
@@ -95,21 +98,6 @@ def _render_receipt_result(receipt) -> str:
         lines.append(f"Відсутнє або нечитабельне: {', '.join(missing_fields)}")
     if preflight_errors:
         lines.append(f"Помилки preflight: {', '.join(preflight_errors)}")
-    return "\n".join(lines)
-
-
-def _render_receipt_response(receipt) -> str:
-    if receipt.status == ReceiptStatus.requires_manual_review:
-        return _render_receipt_result(receipt) + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
-
-    lines = _render_receipt_result(receipt).splitlines()
-    lines.append("")
-    if receipt.status == ReceiptStatus.validated:
-        lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
-    elif receipt.status == ReceiptStatus.dry_run_created:
-        lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
-    else:
-        lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
     return "\n".join(lines)
 
 
@@ -207,7 +195,26 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
 
-        await message.answer(_render_receipt_response(receipt))
+        if receipt.status == ReceiptStatus.requires_manual_review:
+            await message.answer(
+                _render_receipt_result(receipt)
+                + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
+            )
+            return
+
+        lines = _render_receipt_result(receipt).splitlines()
+        if receipt.status == ReceiptStatus.validated:
+            lines.append("")
+            lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
+            await message.answer("\n".join(lines))
+            return
+
+        lines.append("")
+        if receipt.status == ReceiptStatus.dry_run_created:
+            lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
+        else:
+            lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
+        await message.answer("\n".join(lines))
 
     @dp.message(F.document)
     async def handle_document(message: Message) -> None:
@@ -239,7 +246,26 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
 
-        await message.answer(_render_receipt_response(receipt))
+        if receipt.status == ReceiptStatus.requires_manual_review:
+            await message.answer(
+                _render_receipt_result(receipt)
+                + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
+            )
+            return
+
+        lines = _render_receipt_result(receipt).splitlines()
+        if receipt.status == ReceiptStatus.validated:
+            lines.append("")
+            lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
+            await message.answer("\n".join(lines))
+            return
+
+        lines.append("")
+        if receipt.status == ReceiptStatus.dry_run_created:
+            lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
+        else:
+            lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
+        await message.answer("\n".join(lines))
 
     @dp.message()
     async def fallback(message: Message) -> None:

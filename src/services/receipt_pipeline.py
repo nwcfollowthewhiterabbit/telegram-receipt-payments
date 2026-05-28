@@ -6,8 +6,9 @@ from aiogram import Bot
 from aiogram.types import Message
 from sqlalchemy.orm import Session
 
-from src.clients.privat24 import Privat24Client
 from src.config import get_settings
+from src.connectors.crm.registry import build_crm_connector
+from src.connectors.payments.registry import build_payment_connector
 from src.db.models import ActionType, PaymentDraft, Receipt, ReceiptStatus
 from .audit import write_audit_log
 from .document_text import DocumentTextExtractor
@@ -16,12 +17,14 @@ from .purpose_builder import PaymentPurposeBuilder
 from .schemas import ReceiptValidationResult
 from .vision import ReceiptVisionService
 
+
 class ReceiptPipeline:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.vision = ReceiptVisionService()
         self.text_extractor = DocumentTextExtractor()
-        self.privat24 = Privat24Client()
+        self.payment_connector = build_payment_connector(self.settings)
+        self.crm_connector = build_crm_connector(self.settings)
 
     @staticmethod
     def _has_required_invoice_fields(validation: ReceiptValidationResult) -> bool:
@@ -112,6 +115,10 @@ class ReceiptPipeline:
         storage_path: Path,
         mime_type: str,
     ) -> Receipt:
+        existing = db.query(Receipt).filter(Receipt.telegram_file_id == telegram_file_id).first()
+        if existing:
+            return existing
+
         receipt = Receipt(
             telegram_user_id=telegram_user_id,
             telegram_chat_id=telegram_chat_id,
@@ -172,7 +179,8 @@ class ReceiptPipeline:
             **receipt.validation_payload,
             "payment_purpose_final": preflight.normalized_purpose,
             "preflight_errors": preflight.errors,
-            "execution_mode": "dry_run" if self.settings.privat24_dry_run else "live",
+            "payment_provider": self.settings.payment_provider,
+            "execution_mode": "dry_run" if self.settings.payment_dry_run else "live",
         }
         db.add(receipt)
         db.commit()
@@ -201,11 +209,12 @@ class ReceiptPipeline:
             payload={
                 "purpose": preflight.normalized_purpose,
                 "procurement_category": PaymentPurposeBuilder.infer_category(validation),
-                "execution_mode": "dry_run" if self.settings.privat24_dry_run else "live",
+                "payment_provider": self.settings.payment_provider,
+                "execution_mode": "dry_run" if self.settings.payment_dry_run else "live",
             },
         )
         try:
-            draft_result = self.privat24.create_payment_draft(
+            draft_result = self.payment_connector.create_payment_draft(
                 document_number=self._document_number(receipt.id),
                 beneficiary_name=preflight.normalized_supplier_name,
                 beneficiary_tax_id=preflight.normalized_supplier_tax_id,
@@ -241,9 +250,10 @@ class ReceiptPipeline:
 
         payment_draft = PaymentDraft(
             receipt_id=receipt.id,
+            provider_name=self.payment_connector.provider_name,
             provider_payment_id=draft_result.provider_payment_id,
             provider_pack_id=draft_result.provider_pack_id,
-            source_account=self.settings.privat24_source_account,
+            source_account=self.payment_connector.source_account(),
             beneficiary_name=preflight.normalized_supplier_name,
             beneficiary_tax_id=preflight.normalized_supplier_tax_id,
             beneficiary_iban=preflight.normalized_supplier_iban,
@@ -257,7 +267,7 @@ class ReceiptPipeline:
         )
         db.add(payment_draft)
         if draft_result.created:
-            receipt.status = ReceiptStatus.dry_run_created if self.settings.privat24_dry_run else ReceiptStatus.bank_created
+            receipt.status = ReceiptStatus.dry_run_created if self.settings.payment_dry_run else ReceiptStatus.bank_created
         else:
             receipt.status = ReceiptStatus.payment_draft_failed
         db.add(receipt)
@@ -272,7 +282,51 @@ class ReceiptPipeline:
             message="Payment draft processed",
             payload=draft_result.model_dump(mode="json"),
         )
+        self._sync_crm(db, telegram_user_id, receipt, payment_draft)
         return receipt
+
+    def _sync_crm(
+        self,
+        db: Session,
+        telegram_user_id: int,
+        receipt: Receipt,
+        payment_draft: PaymentDraft | None,
+    ) -> None:
+        try:
+            crm_result = self.crm_connector.sync_receipt(receipt, payment_draft)
+        except Exception as exc:
+            receipt.validation_payload = {
+                **(receipt.validation_payload or {}),
+                "crm_sync_error": str(exc),
+            }
+            db.add(receipt)
+            db.commit()
+            write_audit_log(
+                db,
+                action_type=ActionType.payment_draft_failed,
+                telegram_user_id=telegram_user_id,
+                receipt_id=receipt.id,
+                message="CRM sync failed",
+                payload={"error": str(exc), "crm_provider": self.settings.crm_provider},
+            )
+            return
+
+        receipt.validation_payload = {
+            **(receipt.validation_payload or {}),
+            "crm_provider": crm_result.provider_name,
+            "crm_sync_status": crm_result.status,
+            "crm_external_id": crm_result.external_id,
+        }
+        db.add(receipt)
+        db.commit()
+        write_audit_log(
+            db,
+            action_type=ActionType.payment_draft_created,
+            telegram_user_id=telegram_user_id,
+            receipt_id=receipt.id,
+            message="CRM sync processed",
+            payload=crm_result.model_dump(mode="json"),
+        )
 
     def _validate_saved_file(self, storage_path: Path, mime_type: str, original_filename: str) -> ReceiptValidationResult:
         extension = storage_path.suffix.lower()

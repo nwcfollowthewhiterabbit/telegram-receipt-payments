@@ -13,8 +13,13 @@ from src.services.schemas import PaymentDraftResult
 
 
 class Privat24Client:
+    provider_name = "privat24"
+
     def __init__(self) -> None:
         self.settings = get_settings()
+
+    def source_account(self) -> str:
+        return self.settings.privat24_source_account
 
     def _headers(self) -> dict[str, str]:
         return {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -52,12 +53,29 @@ def _parse_phone_list(value: str | None) -> list[str]:
     return result
 
 
+def _parse_json_object(value: str | None) -> dict[str, str]:
+    if not value:
+        return {}
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Expected a JSON object")
+    return {str(key): str(item) for key, item in parsed.items()}
+
+
 def _env_or_default(name: str, default: str) -> str:
     value = os.getenv(name)
     if value is None:
         return default
     value = value.strip()
     return value or default
+
+
+def _optional_env(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
 
 
 @dataclass(slots=True)
@@ -71,6 +89,8 @@ class Settings:
     allowed_user_ids: list[int] = field(default_factory=lambda: _parse_int_list(os.getenv("ALLOWED_USER_IDS")))
     allowed_phone_numbers: list[str] = field(default_factory=lambda: _parse_phone_list(os.getenv("ALLOWED_PHONE_NUMBERS")))
     receipt_storage_dir: str = field(default_factory=lambda: os.getenv("RECEIPT_STORAGE_DIR", "/app/data/receipts"))
+    payment_provider: str = field(default_factory=lambda: _env_or_default("PAYMENT_PROVIDER", "privat24").lower())
+    payment_dry_run_override: str | None = field(default_factory=lambda: _optional_env("PAYMENT_DRY_RUN"))
     privat24_api_base_url: str = field(default_factory=lambda: _env_or_default("PRIVAT24_API_BASE_URL", "https://acp.privatbank.ua"))
     privat24_api_token: str = field(default_factory=lambda: os.getenv("PRIVAT24_API_TOKEN", ""))
     privat24_source_account: str = field(default_factory=lambda: os.getenv("PRIVAT24_SOURCE_ACCOUNT", ""))
@@ -90,12 +110,37 @@ class Settings:
     privat24_receipt_notify_phone: str = field(
         default_factory=lambda: _normalize_phone(os.getenv("PRIVAT24_RECEIPT_NOTIFY_PHONE", ""))
     )
+    monobank_api_base_url: str = field(
+        default_factory=lambda: _env_or_default("MONOBANK_API_BASE_URL", "https://corp-api.monobank.ua")
+    )
+    monobank_api_token: str = field(default_factory=lambda: os.getenv("MONOBANK_API_TOKEN", ""))
+    monobank_source_iban: str = field(default_factory=lambda: os.getenv("MONOBANK_SOURCE_IBAN", ""))
+    monobank_dry_run: bool = field(default_factory=lambda: _parse_bool(os.getenv("MONOBANK_DRY_RUN"), True))
+    crm_provider: str = field(default_factory=lambda: _env_or_default("CRM_PROVIDER", "none").lower())
+    crm_dry_run: bool = field(default_factory=lambda: _parse_bool(os.getenv("CRM_DRY_RUN"), True))
+    terrasoft_mssql_url: str = field(default_factory=lambda: os.getenv("TERRASOFT_MSSQL_URL", ""))
+    terrasoft_invoice_table: str = field(default_factory=lambda: os.getenv("TERRASOFT_INVOICE_TABLE", ""))
+    terrasoft_column_map: dict[str, str] = field(
+        default_factory=lambda: _parse_json_object(os.getenv("TERRASOFT_COLUMN_MAP"))
+    )
     company_name: str = field(default_factory=lambda: os.getenv("COMPANY_NAME", ""))
     default_currency: str = field(default_factory=lambda: os.getenv("DEFAULT_CURRENCY", "UAH"))
+
+    @property
+    def payment_dry_run(self) -> bool:
+        if self.payment_dry_run_override is not None:
+            return _parse_bool(self.payment_dry_run_override, True)
+        if self.payment_provider == "monobank":
+            return self.monobank_dry_run
+        return self.privat24_dry_run
 
     def validate(self) -> None:
         if not self.telegram_bot_token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+        if self.payment_provider not in {"privat24", "monobank"}:
+            raise RuntimeError("PAYMENT_PROVIDER must be either privat24 or monobank")
+        if self.crm_provider not in {"none", "terrasoft_mssql"}:
+            raise RuntimeError("CRM_PROVIDER must be either none or terrasoft_mssql")
 
 
 @lru_cache
