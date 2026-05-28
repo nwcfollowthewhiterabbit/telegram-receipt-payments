@@ -23,8 +23,11 @@ Main layers:
 - `src/services/payment_preflight.py` normalizes and validates payment requisites.
 - `src/connectors/payments/registry.py` selects the active payment connector.
 - `src/connectors/crm/registry.py` selects the active CRM connector.
+- `src/connectors/communication/registry.py` selects the active communication adapter.
+- `src/connectors/communication/telegram.py` stores Telegram files and converts Telegram messages into transport-neutral incoming files.
 - `src/clients/privat24.py` implements Privat24 payment draft creation and receipt APIs.
 - `src/clients/monobank.py` implements Monobank corporate payment draft creation.
+- `src/connectors/payments/privat24_receipt_monitor.py` handles Privat24-specific receipt polling and Telegram delivery.
 - `src/connectors/crm/terrasoft_mssql.py` implements Terrasoft/XRM v3 MS SQL sync.
 - `src/db/models.py` stores local receipts, payment drafts, authorized users, and audit log.
 
@@ -34,6 +37,7 @@ Runtime selection is controlled by environment variables:
 - `PAYMENT_DRY_RUN=` optional override for all payment connectors
 - `CRM_PROVIDER=none|terrasoft_mssql`
 - `CRM_DRY_RUN=true|false`
+- `COMMUNICATION_PROVIDER=telegram`
 
 Current production-like configuration on the server:
 
@@ -56,9 +60,9 @@ Current production-like configuration on the server:
 
    External systems can fail. Every invoice must keep local status, parsed fields, provider payloads, and audit events.
 
-4. External writes should be idempotent before live CRM sync is enabled.
+4. External writes must be idempotent before live CRM sync is enabled.
 
-   Terrasoft sync should eventually use a stable external key such as local `receipt_id` or payment draft id to avoid duplicate CRM records.
+   Terrasoft sync uses a stable `external_key` based on local `receipt_id`; live MS SQL sync must upsert by that key.
 
 5. Dry-run modes are mandatory for new connectors.
 
@@ -72,10 +76,8 @@ Current production-like configuration on the server:
 
 - `MONOBANK_SOURCE_IBAN` is not configured yet. Monobank returned multiple UAH accounts, so the connector intentionally refuses automatic account selection.
 - Terrasoft table and column names are not confirmed. CRM sync is dry-run until the schema is mapped.
-- CRM sync currently inserts a new record in live mode. It should be upgraded to idempotent upsert once the Terrasoft schema is known.
-- Telegram is structurally an adapter, but there is no formal `communication` connector registry yet.
-- The legacy `src/receipt_pipeline.py` and `src/handlers.py` files appear to be inactive duplicates and should be removed after confirming no scripts import them.
-- The project directory on the server is not currently a git repository.
+- The exact Terrasoft table and column names are not confirmed. CRM sync is dry-run until the schema is mapped.
+- There is only one communication adapter today: Telegram.
 
 ## Terrasoft/XRM v3 Integration Plan
 
@@ -96,8 +98,8 @@ Phase 2: Dry-Run Mapping
 
 Phase 3: Live Upsert
 
-- Add deterministic external key, for example `UsrReceiptId` or `UsrExternalReference`.
-- Change insert-only sync to upsert.
+- Confirm the deterministic external key column, default `UsrExternalKey`.
+- Use the existing MS SQL `MERGE`-based upsert by external key.
 - Add CRM sync status fields locally or persist CRM external id in a dedicated table if needed.
 - Enable `CRM_DRY_RUN=false`.
 - Test with one controlled invoice and verify the Terrasoft record manually.

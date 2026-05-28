@@ -5,6 +5,7 @@ from aiogram.filters import Command
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 from src.config import get_settings
+from src.connectors.communication.registry import build_communication_adapter
 from src.db.models import ActionType, AuthorizedUser, ReceiptStatus
 from src.db.session import SessionLocal
 from src.services.audit import write_audit_log
@@ -15,6 +16,7 @@ from src.services.schemas import ReceiptValidationResult
 
 settings = get_settings()
 pipeline = ReceiptPipeline()
+telegram_adapter = build_communication_adapter(settings)
 
 
 def _is_allowed(user_id: int) -> bool:
@@ -186,8 +188,9 @@ def register_handlers(dp: Dispatcher) -> None:
             return
 
         await message.answer("Фото отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
+        incoming_file = await telegram_adapter.save_photo(message.bot, message)
         with SessionLocal() as db:
-            receipt = await pipeline.handle_photo(message.bot, db, message)
+            receipt = pipeline.process_incoming_file(db, incoming_file)
 
         if receipt.status == ReceiptStatus.unreadable:
             await message.answer(
@@ -234,8 +237,9 @@ def register_handlers(dp: Dispatcher) -> None:
 
         await message.answer("Файл отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
         try:
+            incoming_file = await telegram_adapter.save_document(message.bot, message)
             with SessionLocal() as db:
-                receipt = await pipeline.handle_document(message.bot, db, message)
+                receipt = pipeline.process_incoming_file(db, incoming_file)
         except ValueError:
             await message.answer("Підтримуються лише фото, PDF, XLS і XLSX.")
             return

@@ -79,6 +79,7 @@ cp .env.example .env
 - `OPENAI_API_KEY`
 - `ALLOWED_USER_IDS`
 - `PAYMENT_PROVIDER` (`privat24` или `monobank`)
+- `COMMUNICATION_PROVIDER` (`telegram`)
 - `PRIVAT24_API_BASE_URL`
 - `PRIVAT24_API_TOKEN`
 - `PRIVAT24_SOURCE_ACCOUNT`
@@ -143,6 +144,7 @@ python3 -m scripts.test_invoice_parsing /path/to/invoices
 - `TERRASOFT_MSSQL_URL` — SQLAlchemy URL подключения, например `mssql+pymssql://user:pass@host:1433/dbname`.
 - `TERRASOFT_INVOICE_TABLE` — таблица Terrasoft для счетов, например `dbo.UsrReceiptInvoice`.
 - `TERRASOFT_COLUMN_MAP` — JSON-маппинг внутренних полей на колонки Terrasoft, если стандартные `Usr...` имена отличаются.
+- `COMMUNICATION_PROVIDER` — активный adapter входящего канала, сейчас поддерживается `telegram`.
 
 ## Структура
 
@@ -152,10 +154,20 @@ python3 -m scripts.test_invoice_parsing /path/to/invoices
 - [src/services/receipt_pipeline.py](/home/wroot/receipt-paybot/src/services/receipt_pipeline.py:1) — пайплайн счета на оплату.
 - [src/connectors/payments/registry.py](/home/wroot/receipt-paybot/src/connectors/payments/registry.py:1) — выбор платежного коннектора.
 - [src/connectors/crm/registry.py](/home/wroot/receipt-paybot/src/connectors/crm/registry.py:1) — выбор CRM-коннектора.
+- [src/connectors/communication/registry.py](/home/wroot/receipt-paybot/src/connectors/communication/registry.py:1) — выбор коммуникационного adapter.
 - [src/services/vision.py](/home/wroot/receipt-paybot/src/services/vision.py:1) — OCR/vision-валидация счета.
 - [src/clients/privat24.py](/home/wroot/receipt-paybot/src/clients/privat24.py:1) — адаптер Privat24.
+- [src/connectors/payments/privat24_receipt_monitor.py](/home/wroot/receipt-paybot/src/connectors/payments/privat24_receipt_monitor.py:1) — Privat24-specific монитор квитанций.
 - [src/clients/monobank.py](/home/wroot/receipt-paybot/src/clients/monobank.py:1) — адаптер monobank.
 - [src/connectors/crm/terrasoft_mssql.py](/home/wroot/receipt-paybot/src/connectors/crm/terrasoft_mssql.py:1) — адаптер Terrasoft/XRM v3 через MS SQL.
+
+## Проверка архитектуры
+
+```bash
+python -m scripts.check_architecture
+```
+
+Скрипт проверяет, что service layer не импортирует Telegram/aiogram напрямую, и что registry собирает активные payment/CRM connectors.
 - [src/db/models.py](/home/wroot/receipt-paybot/src/db/models.py:1) — модели БД.
 
 ## Что я бы сделал следующим шагом

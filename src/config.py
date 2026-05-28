@@ -123,6 +123,7 @@ class Settings:
     terrasoft_column_map: dict[str, str] = field(
         default_factory=lambda: _parse_json_object(os.getenv("TERRASOFT_COLUMN_MAP"))
     )
+    communication_provider: str = field(default_factory=lambda: _env_or_default("COMMUNICATION_PROVIDER", "telegram").lower())
     company_name: str = field(default_factory=lambda: os.getenv("COMPANY_NAME", ""))
     default_currency: str = field(default_factory=lambda: os.getenv("DEFAULT_CURRENCY", "UAH"))
 
@@ -141,6 +142,8 @@ class Settings:
             raise RuntimeError("PAYMENT_PROVIDER must be either privat24 or monobank")
         if self.crm_provider not in {"none", "terrasoft_mssql"}:
             raise RuntimeError("CRM_PROVIDER must be either none or terrasoft_mssql")
+        if self.communication_provider not in {"telegram"}:
+            raise RuntimeError("COMMUNICATION_PROVIDER must be telegram")
 
 
 @lru_cache

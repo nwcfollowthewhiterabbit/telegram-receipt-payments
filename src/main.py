@@ -8,8 +8,8 @@ from aiogram import Bot, Dispatcher
 
 from src.bot.handlers import register_handlers
 from src.config import get_settings
+from src.connectors.payments.privat24_receipt_monitor import PaymentReceiptMonitor
 from src.db.session import init_db
-from src.services.payment_receipt_monitor import PaymentReceiptMonitor
 
 
 logging.basicConfig(level=logging.INFO)

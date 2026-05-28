@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aiogram import Bot
-from aiogram.types import Message
 from sqlalchemy.orm import Session
 
 from src.config import get_settings
+from src.connectors.communication.base import StoredIncomingFile
 from src.connectors.crm.registry import build_crm_connector
 from src.connectors.payments.registry import build_payment_connector
 from src.db.models import ActionType, PaymentDraft, Receipt, ReceiptStatus
@@ -40,46 +39,15 @@ class ReceiptPipeline:
     def _document_number(receipt_id: int) -> str:
         return f"RCPT{receipt_id:04d}"
 
-    async def handle_photo(self, bot: Bot, db: Session, message: Message) -> Receipt:
-        photo = message.photo[-1]
-        telegram_file = await bot.get_file(photo.file_id)
-        target_dir = Path(self.settings.receipt_storage_dir)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / f"{message.from_user.id}_{photo.file_unique_id}.jpg"
-        await bot.download_file(telegram_file.file_path, destination=str(target_path))
+    def process_incoming_file(self, db: Session, incoming_file: StoredIncomingFile) -> Receipt:
         return self._process_saved_file(
             db=db,
-            telegram_user_id=message.from_user.id,
-            telegram_chat_id=message.chat.id,
-            telegram_file_id=photo.file_id,
-            original_filename=target_path.name,
-            storage_path=target_path,
-            mime_type="image/jpeg",
-        )
-
-    async def handle_document(self, bot: Bot, db: Session, message: Message) -> Receipt:
-        document = message.document
-        mime_type = document.mime_type or ""
-        extension = Path(document.file_name or "invoice.bin").suffix.lower()
-        is_image = mime_type.startswith("image/") or extension in {".jpg", ".jpeg", ".png", ".webp"}
-        is_supported_doc = extension in DocumentTextExtractor.SUPPORTED_EXTENSIONS
-        if not is_image and not is_supported_doc:
-            raise ValueError("unsupported_document_type")
-
-        extension = extension or ".bin"
-        telegram_file = await bot.get_file(document.file_id)
-        target_dir = Path(self.settings.receipt_storage_dir)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / f"{message.from_user.id}_{document.file_unique_id}{extension}"
-        await bot.download_file(telegram_file.file_path, destination=str(target_path))
-        return self._process_saved_file(
-            db=db,
-            telegram_user_id=message.from_user.id,
-            telegram_chat_id=message.chat.id,
-            telegram_file_id=document.file_id,
-            original_filename=document.file_name or target_path.name,
-            storage_path=target_path,
-            mime_type=mime_type,
+            telegram_user_id=incoming_file.telegram_user_id,
+            telegram_chat_id=incoming_file.telegram_chat_id,
+            telegram_file_id=incoming_file.telegram_file_id,
+            original_filename=incoming_file.original_filename,
+            storage_path=incoming_file.storage_path,
+            mime_type=incoming_file.mime_type,
         )
 
     def process_local_file(self, db: Session, file_path: str) -> Receipt:
