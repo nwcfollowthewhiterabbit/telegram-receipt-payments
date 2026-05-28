@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from decimal import Decimal
-from uuid import NAMESPACE_URL, uuid5
+from uuid import uuid4
 
 from sqlalchemy import create_engine, text
 
@@ -46,7 +46,7 @@ class TerrasoftMssqlConnector:
             recipient = self._find_account_by_supplier_code(connection, receipt.extracted_supplier_tax_id)
             payload["recipient_id"] = recipient["id"] if recipient else None
             payload["recipient_match"] = recipient
-            connection.execute(*self._build_cashflow_upsert(payload))
+            connection.execute(*self._build_cashflow_insert(payload))
 
         return CrmSyncResult(
             synced=True,
@@ -73,13 +73,14 @@ class TerrasoftMssqlConnector:
 
     def _build_payload(self, receipt: Receipt, payment_draft: PaymentDraft | None) -> dict:
         now = dt.datetime.utcnow()
-        external_key = f"receipt-paybot:receipt:{receipt.id}"
+        cashflow_id = str(uuid4())
+        external_key = f"receipt-paybot:cashflow:{cashflow_id}"
         amount = Decimal(str(payment_draft.amount if payment_draft else receipt.extracted_amount or 0)).quantize(
             Decimal("0.01")
         )
         estimated_date = self._estimated_date(receipt)
         return {
-            "id": str(uuid5(NAMESPACE_URL, external_key)),
+            "id": cashflow_id,
             "external_key": external_key,
             "created_on": now,
             "modified_on": now,
@@ -100,8 +101,8 @@ class TerrasoftMssqlConnector:
             "use_as_cashflow": 1,
             "use_as_pandl": 1,
             "autocalc_amount": 0,
-            "cf_number": self._cf_number(receipt),
-            "comments_payer": self._comments_payer(receipt, payment_draft),
+            "cf_number": self._cf_number(receipt, cashflow_id),
+            "comments_payer": self._comments_payer(receipt, payment_draft, external_key),
             "recipient_match": None,
         }
 
@@ -124,12 +125,13 @@ class TerrasoftMssqlConnector:
 
     @staticmethod
     def _period_id_for_date(value: dt.datetime) -> str | None:
-        # Existing periods are monthly records named MM.YYYY. The lookup is resolved by SQL during upsert.
+        # Existing periods are monthly records named MM.YYYY. The lookup is resolved by SQL during insert.
         return value.strftime("%m.%Y")
 
     @staticmethod
-    def _cf_number(receipt: Receipt) -> str:
-        return f"RPB-{receipt.id:06d}"
+    def _cf_number(receipt: Receipt, cashflow_id: str | None = None) -> str:
+        suffix = cashflow_id.replace("-", "")[:6].upper() if cashflow_id else ""
+        return f"RPB-{receipt.id:06d}-{suffix}" if suffix else f"RPB-{receipt.id:06d}"
 
     @staticmethod
     def _subject(receipt: Receipt, payment_draft: PaymentDraft | None) -> str:
@@ -141,11 +143,12 @@ class TerrasoftMssqlConnector:
         return f"Оплата счета {invoice} - {supplier}"[:500]
 
     @staticmethod
-    def _comments_payer(receipt: Receipt, payment_draft: PaymentDraft | None) -> str:
+    def _comments_payer(receipt: Receipt, payment_draft: PaymentDraft | None, external_key: str) -> str:
         lines = [
             "ReceiptPayBot",
             f"Receipt ID: {receipt.id}",
-            f"External key: receipt-paybot:receipt:{receipt.id}",
+            "Mode: create new Terrasoft operation for each processing attempt",
+            f"External key: {external_key}",
             f"Payment provider: {payment_draft.provider_name if payment_draft else ''}",
             f"Provider payment ID: {payment_draft.provider_payment_id if payment_draft else ''}",
             f"Invoice: {receipt.extracted_invoice_number or ''} {receipt.extracted_invoice_date or ''}",
@@ -185,54 +188,26 @@ class TerrasoftMssqlConnector:
         )
         return dict(row) if row else None
 
-    def _build_cashflow_upsert(self, payload: dict) -> tuple:
+    def _build_cashflow_insert(self, payload: dict) -> tuple:
         query = text(
             """
             DECLARE @PeriodID uniqueidentifier;
             SELECT TOP 1 @PeriodID = ID FROM dbo.tbl_Period WHERE Name = :period_name ORDER BY StartDate DESC;
 
-            IF EXISTS (SELECT 1 FROM dbo.tbl_Cashflow WHERE CodPrivat = :external_key)
-            BEGIN
-                UPDATE dbo.tbl_Cashflow
-                SET ModifiedOn = :modified_on,
-                    CashAccountID = CONVERT(uniqueidentifier, :cash_account_id),
-                    TypeID = CONVERT(uniqueidentifier, :type_id),
-                    RecipientID = CASE WHEN :recipient_id IS NULL THEN NULL ELSE CONVERT(uniqueidentifier, :recipient_id) END,
-                    PayerID = CONVERT(uniqueidentifier, :payer_id),
-                    StatusID = CONVERT(uniqueidentifier, :status_id),
-                    PeriodID = @PeriodID,
-                    CurrencyID = CONVERT(uniqueidentifier, :currency_id),
-                    EstimatedDate = :estimated_date,
-                    ActualDate = :actual_date,
-                    Subject = :subject,
-                    CurrencyRate = :currency_rate,
-                    Amount = :amount,
-                    BasicAmount = :basic_amount,
-                    OwnerID = CONVERT(uniqueidentifier, :owner_id),
-                    UseAsCashflow = :use_as_cashflow,
-                    UseAsPandL = :use_as_pandl,
-                    AutocalcAmount = :autocalc_amount,
-                    CFNumber = :cf_number,
-                    CommentsPayer = :comments_payer
-                WHERE CodPrivat = :external_key;
-            END
-            ELSE
-            BEGIN
-                INSERT INTO dbo.tbl_Cashflow (
-                    ID, CreatedOn, ModifiedOn, CashAccountID, TypeID, RecipientID, PayerID, StatusID, PeriodID,
-                    CurrencyID, EstimatedDate, ActualDate, Subject, CurrencyRate, Amount, BasicAmount, OwnerID,
-                    UseAsCashflow, UseAsPandL, AutocalcAmount, CFNumber, CommentsPayer, CodPrivat
-                )
-                VALUES (
-                    CONVERT(uniqueidentifier, :id), :created_on, :modified_on, CONVERT(uniqueidentifier, :cash_account_id),
-                    CONVERT(uniqueidentifier, :type_id),
-                    CASE WHEN :recipient_id IS NULL THEN NULL ELSE CONVERT(uniqueidentifier, :recipient_id) END,
-                    CONVERT(uniqueidentifier, :payer_id), CONVERT(uniqueidentifier, :status_id), @PeriodID,
-                    CONVERT(uniqueidentifier, :currency_id), :estimated_date, :actual_date, :subject, :currency_rate,
-                    :amount, :basic_amount, CONVERT(uniqueidentifier, :owner_id), :use_as_cashflow, :use_as_pandl,
-                    :autocalc_amount, :cf_number, :comments_payer, :external_key
-                );
-            END
+            INSERT INTO dbo.tbl_Cashflow (
+                ID, CreatedOn, ModifiedOn, CashAccountID, TypeID, RecipientID, PayerID, StatusID, PeriodID,
+                CurrencyID, EstimatedDate, ActualDate, Subject, CurrencyRate, Amount, BasicAmount, OwnerID,
+                UseAsCashflow, UseAsPandL, AutocalcAmount, CFNumber, CommentsPayer, CodPrivat
+            )
+            VALUES (
+                CONVERT(uniqueidentifier, :id), :created_on, :modified_on, CONVERT(uniqueidentifier, :cash_account_id),
+                CONVERT(uniqueidentifier, :type_id),
+                CASE WHEN :recipient_id IS NULL THEN NULL ELSE CONVERT(uniqueidentifier, :recipient_id) END,
+                CONVERT(uniqueidentifier, :payer_id), CONVERT(uniqueidentifier, :status_id), @PeriodID,
+                CONVERT(uniqueidentifier, :currency_id), :estimated_date, :actual_date, :subject, :currency_rate,
+                :amount, :basic_amount, CONVERT(uniqueidentifier, :owner_id), :use_as_cashflow, :use_as_pandl,
+                :autocalc_amount, :cf_number, :comments_payer, :external_key
+            );
             """
         )
         return query, {**payload, "period_name": payload["period_id"]}

@@ -60,9 +60,9 @@ Current production-like configuration on the server:
 
    External systems can fail. Every invoice must keep local status, parsed fields, provider payloads, and audit events.
 
-4. External writes must be idempotent before live CRM sync is enabled.
+4. CRM cashflow writes are operation-creation commands, not state synchronization.
 
-   Terrasoft sync uses a stable `external_key` based on local `receipt_id`; live MS SQL sync must upsert by that key.
+   Each invoice processing attempt may intentionally create a new client-bank payment draft and a new Terrasoft cashflow operation. Do not upsert repeated attempts into a previous operation.
 
 5. Dry-run modes are mandatory for new connectors.
 
@@ -96,10 +96,11 @@ Phase 2: Dry-Run Mapping
 - Process several real invoice examples and inspect audit payloads.
 - Verify that parsed data matches accounting expectations before enabling writes.
 
-Phase 3: Live Upsert
+Phase 3: Live Insert
 
-- Use `tbl_Cashflow.CodPrivat` as the deterministic external key: `receipt-paybot:receipt:<id>`.
-- Upsert `tbl_Cashflow` by `CodPrivat`.
+- Insert a new `tbl_Cashflow` row for each processing attempt.
+- Store a unique `tbl_Cashflow.CodPrivat` marker in the form `receipt-paybot:cashflow:<uuid>`.
+- Keep the local receipt id, supplier details, bank draft details, and source filename in `CommentsPayer` for audit.
 - Resolve supplier account by `tbl_Account.TaxRegistrationCode` or `tbl_Account.Code`; if not found, leave `RecipientID` empty and write supplier details to `CommentsPayer`.
 - Add CRM sync status fields locally or persist CRM external id in a dedicated table if needed.
 - Enable `CRM_DRY_RUN=false`.
@@ -167,4 +168,4 @@ Phase 4: Operational Hardening
 3. Decide whether Terrasoft direct MS SQL writes are acceptable.
 4. Initialize or connect the project to a GitHub repository.
 5. Convert CRM dry-run payload into a confirmed Terrasoft column map.
-6. Add idempotent CRM upsert before enabling `CRM_DRY_RUN=false`.
+6. Test controlled Terrasoft insert on `Terrasoft_test` and verify the created operation manually.
