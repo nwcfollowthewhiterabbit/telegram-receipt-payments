@@ -2,38 +2,25 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from decimal import Decimal
 from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import create_engine, text
 
 from src.config import get_settings
-from src.db.models import PaymentDraft, Receipt
+from src.db.models import PaymentDraft, Receipt, ReceiptStatus
 from src.services.schemas import CrmSyncResult
 
 
-DEFAULT_COLUMN_MAP = {
-    "id": "Id",
-    "external_key": "UsrExternalKey",
-    "created_on": "CreatedOn",
-    "modified_on": "ModifiedOn",
-    "receipt_id": "UsrReceiptId",
-    "telegram_user_id": "UsrTelegramUserId",
-    "supplier_name": "UsrSupplierName",
-    "supplier_tax_id": "UsrSupplierTaxId",
-    "supplier_iban": "UsrSupplierIban",
-    "invoice_number": "UsrInvoiceNumber",
-    "invoice_date": "UsrInvoiceDate",
-    "amount": "UsrAmount",
-    "currency": "UsrCurrency",
-    "payment_purpose": "UsrPaymentPurpose",
-    "payment_provider": "UsrPaymentProvider",
-    "payment_draft_id": "UsrPaymentDraftId",
-    "payment_status": "UsrPaymentStatus",
-    "provider_payment_id": "UsrProviderPaymentId",
-}
+TERRASOFT_TEST_DATABASE = "Terrasoft_test"
+TERRASOFT_CASHFLOW_TABLE = "dbo.tbl_Cashflow"
 
-IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+CASHFLOW_TYPE_EXPENSE_ID = "484C8429-DABF-482A-BC7B-4C75D1436A1B"
+CASHFLOW_STATUS_PLANNED_ID = "D7141996-2996-4BB2-BCCD-E422A54AA02E"
+CASHFLOW_STATUS_TO_PAY_ID = "A0EE28EC-0074-414A-ABE9-0526F923A84A"
+CURRENCY_UAH_ID = "D18AAED6-14F9-435C-9606-0E90CAE816F7"
+PAYER_RENTALL_ACCOUNT_ID = "E308B781-3C5B-4ECB-89EF-5C1ED4DA488E"
+MONOBANK_UAH_CASH_ACCOUNT_ID = "FF8B6D7F-50F8-4F38-8BC8-6AAD2E345263"
 
 
 class TerrasoftMssqlConnector:
@@ -41,7 +28,6 @@ class TerrasoftMssqlConnector:
 
     def __init__(self) -> None:
         self.settings = get_settings()
-        self.column_map = {**DEFAULT_COLUMN_MAP, **self.settings.terrasoft_column_map}
 
     def sync_receipt(self, receipt: Receipt, payment_draft: PaymentDraft | None) -> CrmSyncResult:
         payload = self._build_payload(receipt, payment_draft)
@@ -49,101 +35,204 @@ class TerrasoftMssqlConnector:
             return CrmSyncResult(
                 synced=True,
                 provider_name=self.provider_name,
-                external_id=str(payload["id"]),
+                external_id=payload["id"],
                 status="crm_dry_run",
-                payload=self._mapped_payload(payload),
+                payload=payload,
             )
 
-        if not self.settings.terrasoft_mssql_url:
-            raise RuntimeError("TERRASOFT_MSSQL_URL is required for Terrasoft CRM sync")
-        if not self.settings.terrasoft_invoice_table:
-            raise RuntimeError("TERRASOFT_INVOICE_TABLE is required for Terrasoft CRM sync")
-
-        mapped_payload = self._mapped_payload(payload)
-        external_key_column = self.column_map.get("external_key")
-        if not external_key_column or external_key_column not in mapped_payload:
-            raise RuntimeError("Terrasoft CRM sync requires an external_key column for idempotent upsert")
-
+        self._validate_live_target()
         engine = create_engine(self.settings.terrasoft_mssql_url, future=True, pool_pre_ping=True)
         with engine.begin() as connection:
-            connection.execute(*self._build_upsert(mapped_payload, external_key_column))
+            recipient = self._find_account_by_supplier_code(connection, receipt.extracted_supplier_tax_id)
+            payload["recipient_id"] = recipient["id"] if recipient else None
+            payload["recipient_match"] = recipient
+            connection.execute(*self._build_cashflow_upsert(payload))
 
         return CrmSyncResult(
             synced=True,
             provider_name=self.provider_name,
-            external_id=str(payload["id"]),
+            external_id=payload["id"],
             status="crm_synced",
-            payload={"table": self.settings.terrasoft_invoice_table, "id": str(payload["id"])},
+            payload={
+                "database": self.settings.terrasoft_database,
+                "table": TERRASOFT_CASHFLOW_TABLE,
+                "id": payload["id"],
+                "external_key": payload["external_key"],
+                "recipient_match": payload["recipient_match"],
+            },
         )
+
+    def _validate_live_target(self) -> None:
+        if not self.settings.terrasoft_mssql_url:
+            raise RuntimeError("TERRASOFT_MSSQL_URL is required for Terrasoft CRM sync")
+        if self.settings.terrasoft_database != TERRASOFT_TEST_DATABASE:
+            raise RuntimeError("Terrasoft live sync is currently allowed only for Terrasoft_test")
+        table = self.settings.terrasoft_invoice_table or TERRASOFT_CASHFLOW_TABLE
+        if table != TERRASOFT_CASHFLOW_TABLE:
+            raise RuntimeError("Terrasoft cashflow sync requires TERRASOFT_INVOICE_TABLE=dbo.tbl_Cashflow")
 
     def _build_payload(self, receipt: Receipt, payment_draft: PaymentDraft | None) -> dict:
         now = dt.datetime.utcnow()
-        provider_payload = payment_draft.provider_payload if payment_draft else {}
-        purpose = payment_draft.purpose if payment_draft else (receipt.validation_payload or {}).get("payment_purpose_final")
         external_key = f"receipt-paybot:receipt:{receipt.id}"
+        amount = Decimal(str(payment_draft.amount if payment_draft else receipt.extracted_amount or 0)).quantize(
+            Decimal("0.01")
+        )
+        estimated_date = self._estimated_date(receipt)
         return {
             "id": str(uuid5(NAMESPACE_URL, external_key)),
             "external_key": external_key,
             "created_on": now,
             "modified_on": now,
-            "receipt_id": receipt.id,
-            "telegram_user_id": receipt.telegram_user_id,
-            "supplier_name": receipt.extracted_supplier_name,
-            "supplier_tax_id": receipt.extracted_supplier_tax_id,
-            "supplier_iban": receipt.extracted_supplier_iban,
-            "invoice_number": receipt.extracted_invoice_number,
-            "invoice_date": receipt.extracted_invoice_date,
-            "amount": receipt.extracted_amount,
-            "currency": receipt.extracted_currency,
-            "payment_purpose": purpose,
-            "payment_provider": payment_draft.provider_name if payment_draft else None,
-            "payment_draft_id": payment_draft.id if payment_draft else None,
-            "payment_status": payment_draft.status if payment_draft else receipt.status.value,
-            "provider_payment_id": payment_draft.provider_payment_id if payment_draft else None,
-            "provider_payload": provider_payload,
+            "cash_account_id": MONOBANK_UAH_CASH_ACCOUNT_ID,
+            "type_id": CASHFLOW_TYPE_EXPENSE_ID,
+            "payer_id": PAYER_RENTALL_ACCOUNT_ID,
+            "recipient_id": None,
+            "status_id": self._status_id(receipt, payment_draft),
+            "period_id": self._period_id_for_date(estimated_date),
+            "currency_id": CURRENCY_UAH_ID,
+            "estimated_date": estimated_date,
+            "actual_date": None,
+            "subject": self._subject(receipt, payment_draft),
+            "currency_rate": Decimal("1.0000"),
+            "amount": amount,
+            "basic_amount": amount,
+            "owner_id": "D8D923D0-1A2E-44E1-9072-3D82451A7A7E",
+            "use_as_cashflow": 1,
+            "use_as_pandl": 1,
+            "autocalc_amount": 0,
+            "cf_number": self._cf_number(receipt),
+            "comments_payer": self._comments_payer(receipt, payment_draft),
+            "recipient_match": None,
         }
 
-    def _mapped_payload(self, payload: dict) -> dict:
-        return {
-            column_name: payload[field_name]
-            for field_name, column_name in self.column_map.items()
-            if field_name in payload and column_name
-        }
+    @staticmethod
+    def _status_id(receipt: Receipt, payment_draft: PaymentDraft | None) -> str:
+        if payment_draft and receipt.status in {ReceiptStatus.bank_created, ReceiptStatus.dry_run_created}:
+            return CASHFLOW_STATUS_TO_PAY_ID
+        return CASHFLOW_STATUS_PLANNED_ID
 
-    def _build_upsert(self, mapped_payload: dict, external_key_column: str) -> tuple:
-        table_sql = self._table_sql(self.settings.terrasoft_invoice_table)
-        columns = list(mapped_payload.keys())
-        source_select = ", ".join(
-            f":p{index} AS {self._column_sql(column)}" for index, column in enumerate(columns)
-        )
-        update_columns = [
-            column
-            for column in columns
-            if column not in {external_key_column, self.column_map.get("id"), self.column_map.get("created_on")}
+    @staticmethod
+    def _estimated_date(receipt: Receipt) -> dt.datetime:
+        raw = receipt.extracted_invoice_date
+        if raw:
+            for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
+                try:
+                    return dt.datetime.combine(dt.datetime.strptime(raw, fmt).date(), dt.time.min)
+                except ValueError:
+                    pass
+        return dt.datetime.combine(dt.date.today(), dt.time.min)
+
+    @staticmethod
+    def _period_id_for_date(value: dt.datetime) -> str | None:
+        # Existing periods are monthly records named MM.YYYY. The lookup is resolved by SQL during upsert.
+        return value.strftime("%m.%Y")
+
+    @staticmethod
+    def _cf_number(receipt: Receipt) -> str:
+        return f"RPB-{receipt.id:06d}"
+
+    @staticmethod
+    def _subject(receipt: Receipt, payment_draft: PaymentDraft | None) -> str:
+        purpose = payment_draft.purpose if payment_draft else (receipt.validation_payload or {}).get("payment_purpose_final")
+        if purpose:
+            return str(purpose)[:500]
+        invoice = receipt.extracted_invoice_number or receipt.id
+        supplier = receipt.extracted_supplier_name or "поставщик"
+        return f"Оплата счета {invoice} - {supplier}"[:500]
+
+    @staticmethod
+    def _comments_payer(receipt: Receipt, payment_draft: PaymentDraft | None) -> str:
+        lines = [
+            "ReceiptPayBot",
+            f"Receipt ID: {receipt.id}",
+            f"External key: receipt-paybot:receipt:{receipt.id}",
+            f"Payment provider: {payment_draft.provider_name if payment_draft else ''}",
+            f"Provider payment ID: {payment_draft.provider_payment_id if payment_draft else ''}",
+            f"Invoice: {receipt.extracted_invoice_number or ''} {receipt.extracted_invoice_date or ''}",
+            f"Supplier: {receipt.extracted_supplier_name or ''}",
+            f"Supplier code: {receipt.extracted_supplier_tax_id or ''}",
+            f"Supplier IBAN: {receipt.extracted_supplier_iban or ''}",
+            f"Supplier bank: {receipt.extracted_supplier_bank_name or ''}",
+            f"Purpose: {payment_draft.purpose if payment_draft else (receipt.validation_payload or {}).get('payment_purpose_final', '')}",
+            f"Source file: {receipt.original_filename}",
         ]
-        update_sql = ", ".join(
-            f"target.{self._column_sql(column)} = source.{self._column_sql(column)}" for column in update_columns
+        return "\n".join(lines)[:5000]
+
+    @staticmethod
+    def _normalize_supplier_code(value: str | None) -> str | None:
+        digits = re.sub(r"\D+", "", value or "")
+        return digits or None
+
+    def _find_account_by_supplier_code(self, connection, supplier_code: str | None) -> dict | None:
+        code = self._normalize_supplier_code(supplier_code)
+        if not code:
+            return None
+        row = (
+            connection.execute(
+                text(
+                    """
+                    SELECT TOP 1 CONVERT(nvarchar(36), ID) AS id, Name AS name, TaxRegistrationCode AS tax_code, Code AS code
+                    FROM dbo.tbl_Account
+                    WHERE REPLACE(REPLACE(REPLACE(ISNULL(TaxRegistrationCode, ''), ' ', ''), '-', ''), '.', '') = :code
+                       OR REPLACE(REPLACE(REPLACE(ISNULL(Code, ''), ' ', ''), '-', ''), '.', '') = :code
+                    ORDER BY ModifiedOn DESC
+                    """
+                ),
+                {"code": code},
+            )
+            .mappings()
+            .first()
         )
-        insert_columns = ", ".join(self._column_sql(column) for column in columns)
-        insert_values = ", ".join(f"source.{self._column_sql(column)}" for column in columns)
+        return dict(row) if row else None
+
+    def _build_cashflow_upsert(self, payload: dict) -> tuple:
         query = text(
-            f"MERGE {table_sql} AS target "
-            f"USING (SELECT {source_select}) AS source "
-            f"ON target.{self._column_sql(external_key_column)} = source.{self._column_sql(external_key_column)} "
-            f"WHEN MATCHED THEN UPDATE SET {update_sql} "
-            f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values});"
+            """
+            DECLARE @PeriodID uniqueidentifier;
+            SELECT TOP 1 @PeriodID = ID FROM dbo.tbl_Period WHERE Name = :period_name ORDER BY StartDate DESC;
+
+            IF EXISTS (SELECT 1 FROM dbo.tbl_Cashflow WHERE CodPrivat = :external_key)
+            BEGIN
+                UPDATE dbo.tbl_Cashflow
+                SET ModifiedOn = :modified_on,
+                    CashAccountID = CONVERT(uniqueidentifier, :cash_account_id),
+                    TypeID = CONVERT(uniqueidentifier, :type_id),
+                    RecipientID = CASE WHEN :recipient_id IS NULL THEN NULL ELSE CONVERT(uniqueidentifier, :recipient_id) END,
+                    PayerID = CONVERT(uniqueidentifier, :payer_id),
+                    StatusID = CONVERT(uniqueidentifier, :status_id),
+                    PeriodID = @PeriodID,
+                    CurrencyID = CONVERT(uniqueidentifier, :currency_id),
+                    EstimatedDate = :estimated_date,
+                    ActualDate = :actual_date,
+                    Subject = :subject,
+                    CurrencyRate = :currency_rate,
+                    Amount = :amount,
+                    BasicAmount = :basic_amount,
+                    OwnerID = CONVERT(uniqueidentifier, :owner_id),
+                    UseAsCashflow = :use_as_cashflow,
+                    UseAsPandL = :use_as_pandl,
+                    AutocalcAmount = :autocalc_amount,
+                    CFNumber = :cf_number,
+                    CommentsPayer = :comments_payer
+                WHERE CodPrivat = :external_key;
+            END
+            ELSE
+            BEGIN
+                INSERT INTO dbo.tbl_Cashflow (
+                    ID, CreatedOn, ModifiedOn, CashAccountID, TypeID, RecipientID, PayerID, StatusID, PeriodID,
+                    CurrencyID, EstimatedDate, ActualDate, Subject, CurrencyRate, Amount, BasicAmount, OwnerID,
+                    UseAsCashflow, UseAsPandL, AutocalcAmount, CFNumber, CommentsPayer, CodPrivat
+                )
+                VALUES (
+                    CONVERT(uniqueidentifier, :id), :created_on, :modified_on, CONVERT(uniqueidentifier, :cash_account_id),
+                    CONVERT(uniqueidentifier, :type_id),
+                    CASE WHEN :recipient_id IS NULL THEN NULL ELSE CONVERT(uniqueidentifier, :recipient_id) END,
+                    CONVERT(uniqueidentifier, :payer_id), CONVERT(uniqueidentifier, :status_id), @PeriodID,
+                    CONVERT(uniqueidentifier, :currency_id), :estimated_date, :actual_date, :subject, :currency_rate,
+                    :amount, :basic_amount, CONVERT(uniqueidentifier, :owner_id), :use_as_cashflow, :use_as_pandl,
+                    :autocalc_amount, :cf_number, :comments_payer, :external_key
+                );
+            END
+            """
         )
-        params = {f"p{index}": mapped_payload[column] for index, column in enumerate(columns)}
-        return query, params
-
-    @staticmethod
-    def _table_sql(value: str) -> str:
-        if not TABLE_RE.match(value):
-            raise RuntimeError("TERRASOFT_INVOICE_TABLE must be schema.table or table with safe SQL identifiers")
-        return ".".join(f"[{part}]" for part in value.split("."))
-
-    @staticmethod
-    def _column_sql(value: str) -> str:
-        if not IDENTIFIER_RE.match(value):
-            raise RuntimeError(f"Unsafe Terrasoft column identifier: {value}")
-        return f"[{value}]"
+        return query, {**payload, "period_name": payload["period_id"]}

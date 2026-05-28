@@ -120,6 +120,7 @@ class Settings:
     crm_dry_run: bool = field(default_factory=lambda: _parse_bool(os.getenv("CRM_DRY_RUN"), True))
     terrasoft_mssql_url: str = field(default_factory=lambda: os.getenv("TERRASOFT_MSSQL_URL", ""))
     terrasoft_invoice_table: str = field(default_factory=lambda: os.getenv("TERRASOFT_INVOICE_TABLE", ""))
+    terrasoft_database: str = field(default_factory=lambda: _env_or_default("TERRASOFT_DATABASE", "Terrasoft_test"))
     terrasoft_column_map: dict[str, str] = field(
         default_factory=lambda: _parse_json_object(os.getenv("TERRASOFT_COLUMN_MAP"))
     )

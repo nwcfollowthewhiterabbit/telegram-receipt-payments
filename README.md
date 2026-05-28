@@ -141,9 +141,10 @@ python3 -m scripts.test_invoice_parsing /path/to/invoices
 - `MONOBANK_DRY_RUN` — если `true`, вместо реального запроса создается локальный черновик-имитация.
 - `CRM_PROVIDER` — активный CRM-коннектор: `none` или `terrasoft_mssql`.
 - `CRM_DRY_RUN` — если `true`, CRM-коннектор не пишет в CRM, а возвращает payload для аудита.
-- `TERRASOFT_MSSQL_URL` — SQLAlchemy URL подключения, например `mssql+pymssql://user:pass@host:1433/dbname`.
-- `TERRASOFT_INVOICE_TABLE` — таблица Terrasoft для счетов, например `dbo.UsrReceiptInvoice`.
-- `TERRASOFT_COLUMN_MAP` — JSON-маппинг внутренних полей на колонки Terrasoft, если стандартные `Usr...` имена отличаются.
+- `TERRASOFT_MSSQL_URL` — SQLAlchemy URL подключения к тестовой базе, например `mssql+pymssql://DOMAIN%5Cuser:pass@192.168.112.20:1433/Terrasoft_test`.
+- `TERRASOFT_DATABASE` — разрешенная база для live-записи; сейчас коннектор принимает только `Terrasoft_test`.
+- `TERRASOFT_INVOICE_TABLE` — таблица операций, сейчас только `dbo.tbl_Cashflow`.
+- `TERRASOFT_COLUMN_MAP` — зарезервировано для будущих CRM-коннекторов; `tbl_Cashflow` маппится явно.
 - `COMMUNICATION_PROVIDER` — активный adapter входящего канала, сейчас поддерживается `telegram`.
 
 ## Структура

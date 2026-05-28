@@ -75,8 +75,8 @@ Current production-like configuration on the server:
 ## Known Gaps
 
 - `MONOBANK_SOURCE_IBAN` is not configured yet. Monobank returned multiple UAH accounts, so the connector intentionally refuses automatic account selection.
-- Terrasoft table and column names are not confirmed. CRM sync is dry-run until the schema is mapped.
-- The exact Terrasoft table and column names are not confirmed. CRM sync is dry-run until the schema is mapped.
+- Terrasoft test mapping targets `Terrasoft_test.dbo.tbl_Cashflow`.
+- Production Terrasoft writes are intentionally blocked in code. The live connector currently allows only `Terrasoft_test`.
 - There is only one communication adapter today: Telegram.
 
 ## Terrasoft/XRM v3 Integration Plan
@@ -98,8 +98,9 @@ Phase 2: Dry-Run Mapping
 
 Phase 3: Live Upsert
 
-- Confirm the deterministic external key column, default `UsrExternalKey`.
-- Use the existing MS SQL `MERGE`-based upsert by external key.
+- Use `tbl_Cashflow.CodPrivat` as the deterministic external key: `receipt-paybot:receipt:<id>`.
+- Upsert `tbl_Cashflow` by `CodPrivat`.
+- Resolve supplier account by `tbl_Account.TaxRegistrationCode` or `tbl_Account.Code`; if not found, leave `RecipientID` empty and write supplier details to `CommentsPayer`.
 - Add CRM sync status fields locally or persist CRM external id in a dedicated table if needed.
 - Enable `CRM_DRY_RUN=false`.
 - Test with one controlled invoice and verify the Terrasoft record manually.
