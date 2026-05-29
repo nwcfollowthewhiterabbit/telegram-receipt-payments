@@ -46,6 +46,7 @@ class TerrasoftMssqlConnector:
             recipient = self._find_account_by_supplier_code(connection, receipt.extracted_supplier_tax_id)
             payload["recipient_id"] = recipient["id"] if recipient else None
             payload["recipient_match"] = recipient
+            payload["cf_number"] = self._next_cf_number(connection)
             connection.execute(*self._build_cashflow_insert(payload))
 
         return CrmSyncResult(
@@ -101,7 +102,7 @@ class TerrasoftMssqlConnector:
             "use_as_cashflow": 1,
             "use_as_pandl": 1,
             "autocalc_amount": 0,
-            "cf_number": self._cf_number(receipt, cashflow_id),
+            "cf_number": None,
             "comments_payer": self._comments_payer(receipt, payment_draft, external_key),
             "recipient_match": None,
         }
@@ -127,11 +128,6 @@ class TerrasoftMssqlConnector:
     def _period_id_for_date(value: dt.datetime) -> str | None:
         # Existing periods are monthly records named MM.YYYY. The lookup is resolved by SQL during insert.
         return value.strftime("%m.%Y")
-
-    @staticmethod
-    def _cf_number(receipt: Receipt, cashflow_id: str | None = None) -> str:
-        suffix = cashflow_id.replace("-", "")[:6].upper() if cashflow_id else ""
-        return f"RPB-{receipt.id:06d}-{suffix}" if suffix else f"RPB-{receipt.id:06d}"
 
     @staticmethod
     def _subject(receipt: Receipt, payment_draft: PaymentDraft | None) -> str:
@@ -187,6 +183,18 @@ class TerrasoftMssqlConnector:
             .first()
         )
         return dict(row) if row else None
+
+    def _next_cf_number(self, connection) -> str:
+        row = connection.execute(
+            text(
+                """
+                SELECT ISNULL(MAX(CAST(SUBSTRING(CFNumber, 3, 32) AS int)), 0) + 1 AS next_number
+                FROM dbo.tbl_Cashflow WITH (UPDLOCK, HOLDLOCK)
+                WHERE CFNumber LIKE 'CF%' AND ISNUMERIC(SUBSTRING(CFNumber, 3, 32)) = 1
+                """
+            )
+        ).scalar_one()
+        return f"CF{int(row)}"
 
     def _build_cashflow_insert(self, payload: dict) -> tuple:
         query = text(

@@ -100,6 +100,7 @@ Phase 3: Live Insert
 
 - Insert a new `tbl_Cashflow` row for each processing attempt.
 - Store a unique `tbl_Cashflow.CodPrivat` marker in the form `receipt-paybot:cashflow:<uuid>`.
+- Generate `CFNumber` in the existing `CF<number>` sequence by taking the current max numeric `CFNumber` under an update/serializable table lock and inserting the next value.
 - Keep the local receipt id, supplier details, bank draft details, and source filename in `CommentsPayer` for audit.
 - Resolve supplier account by `tbl_Account.TaxRegistrationCode` or `tbl_Account.Code`; if not found, leave `RecipientID` empty and write supplier details to `CommentsPayer`.
 - Add CRM sync status fields locally or persist CRM external id in a dedicated table if needed.
