@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 from src.config import get_settings
 from src.connectors.communication.registry import build_communication_adapter
-from src.db.models import ActionType, AuthorizedUser, ReceiptStatus
+from src.db.models import ActionType, AuthorizedUser, Receipt, ReceiptStatus
 from src.db.session import SessionLocal
 from src.services.audit import write_audit_log
 from src.services.purpose_builder import PaymentPurposeBuilder
@@ -52,6 +60,8 @@ def _mode_label() -> str:
 
 def _receipt_mode_label(receipt) -> str:
     payload = receipt.validation_payload or {}
+    if payload.get("payment_ready") and not payload.get("payment_provider"):
+        return "ОЧІКУЄ ВИБОРУ БАНКУ"
     provider = (payload.get("payment_provider") or settings.payment_provider).upper()
     execution_mode = payload.get("execution_mode")
     if execution_mode == "dry_run":
@@ -59,6 +69,21 @@ def _receipt_mode_label(receipt) -> str:
     if execution_mode == "live":
         return f"{provider} / LIVE"
     return _mode_label()
+
+
+def _payment_choice_keyboard(receipt_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Приват24", callback_data=f"pay:privat24:{receipt_id}"),
+                InlineKeyboardButton(text="monobank", callback_data=f"pay:monobank:{receipt_id}"),
+            ]
+        ]
+    )
+
+
+def _is_ready_for_payment_choice(receipt: Receipt) -> bool:
+    return receipt.status == ReceiptStatus.validated and bool((receipt.validation_payload or {}).get("payment_ready"))
 
 
 def _render_receipt_result(receipt) -> str:
@@ -103,6 +128,41 @@ def _render_receipt_result(receipt) -> str:
     return "\n".join(lines)
 
 
+async def _answer_receipt_result(message: Message, receipt: Receipt) -> None:
+    if receipt.status == ReceiptStatus.unreadable:
+        await message.answer(
+            f"Рахунок не пройшов перевірку.\n\nПричина: {receipt.validation_summary}\n\nНадішліть чіткіше зображення."
+        )
+        return
+
+    if receipt.status == ReceiptStatus.requires_manual_review:
+        await message.answer(
+            _render_receipt_result(receipt)
+            + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
+        )
+        return
+
+    lines = _render_receipt_result(receipt).splitlines()
+    lines.append("")
+    if _is_ready_for_payment_choice(receipt):
+        lines.append("Оберіть, звідки платити:")
+        await message.answer("\n".join(lines), reply_markup=_payment_choice_keyboard(receipt.id))
+        return
+
+    if receipt.status == ReceiptStatus.validated:
+        lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
+        await message.answer("\n".join(lines))
+        return
+
+    if receipt.status == ReceiptStatus.dry_run_created:
+        lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
+    elif receipt.status == ReceiptStatus.payment_draft_failed:
+        lines.append("Чернетку платежу не створено. Спробуйте інший банк або перевірте реквізити.")
+    else:
+        lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
+    await message.answer("\n".join(lines))
+
+
 def register_handlers(dp: Dispatcher) -> None:
     @dp.message(Command("start"))
     async def handle_start(message: Message) -> None:
@@ -120,7 +180,7 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
         await message.answer(
-            f"Режим: {_mode_label()}.\nНадішліть рахунок на оплату як фото, PDF, XLS або XLSX. Бот розпізнає реквізити, виконає preflight-перевірку, збереже результат у БД і підготує чернетку платежу.",
+            f"Поточний режим за замовчуванням: {_mode_label()}.\nНадішліть рахунок на оплату як фото, PDF, XLS або XLSX. Бот розпізнає реквізити, виконає preflight-перевірку, збереже результат у БД і запропонує вибрати Приват24 або monobank для чернетки платежу.",
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -192,32 +252,7 @@ def register_handlers(dp: Dispatcher) -> None:
         with SessionLocal() as db:
             receipt = pipeline.process_incoming_file(db, incoming_file)
 
-        if receipt.status == ReceiptStatus.unreadable:
-            await message.answer(
-                f"Рахунок не пройшов перевірку.\n\nПричина: {receipt.validation_summary}\n\nНадішліть чіткіше фото."
-            )
-            return
-
-        if receipt.status == ReceiptStatus.requires_manual_review:
-            await message.answer(
-                _render_receipt_result(receipt)
-                + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
-            )
-            return
-
-        lines = _render_receipt_result(receipt).splitlines()
-        if receipt.status == ReceiptStatus.validated:
-            lines.append("")
-            lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
-            await message.answer("\n".join(lines))
-            return
-
-        lines.append("")
-        if receipt.status == ReceiptStatus.dry_run_created:
-            lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
-        else:
-            lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
-        await message.answer("\n".join(lines))
+        await _answer_receipt_result(message, receipt)
 
     @dp.message(F.document)
     async def handle_document(message: Message) -> None:
@@ -244,32 +279,46 @@ def register_handlers(dp: Dispatcher) -> None:
             await message.answer("Підтримуються лише фото, PDF, XLS і XLSX.")
             return
 
-        if receipt.status == ReceiptStatus.unreadable:
-            await message.answer(
-                f"Рахунок не пройшов перевірку.\n\nПричина: {receipt.validation_summary}\n\nНадішліть чіткіше зображення."
-            )
+        await _answer_receipt_result(message, receipt)
+
+    @dp.callback_query(F.data.startswith("pay:"))
+    async def handle_payment_provider_choice(callback: CallbackQuery) -> None:
+        if not callback.from_user or not _is_allowed(callback.from_user.id):
+            await callback.answer("Доступ заборонено.", show_alert=True)
             return
 
-        if receipt.status == ReceiptStatus.requires_manual_review:
-            await message.answer(
-                _render_receipt_result(receipt)
-                + "\n\nПлатіж не створено. Документ потребує ручної перевірки реквізитів."
-            )
+        parts = (callback.data or "").split(":")
+        if len(parts) != 3:
+            await callback.answer("Некоректний вибір банку.", show_alert=True)
+            return
+        _, provider, receipt_id_raw = parts
+        try:
+            receipt_id = int(receipt_id_raw)
+        except ValueError:
+            await callback.answer("Некоректний рахунок.", show_alert=True)
             return
 
-        lines = _render_receipt_result(receipt).splitlines()
-        if receipt.status == ReceiptStatus.validated:
-            lines.append("")
-            lines.append("Реквізитів достатньо для розпізнавання, але чернетку платежу поки не створено.")
-            await message.answer("\n".join(lines))
-            return
+        with SessionLocal() as db:
+            receipt = db.get(Receipt, receipt_id)
+            if not receipt:
+                await callback.answer("Рахунок не знайдено.", show_alert=True)
+                return
+            if receipt.telegram_user_id != callback.from_user.id:
+                await callback.answer("Цей рахунок належить іншому користувачу.", show_alert=True)
+                return
+            if receipt.status in {ReceiptStatus.dry_run_created, ReceiptStatus.bank_created}:
+                await callback.answer("Чернетку вже створено.", show_alert=True)
+                return
+            if not _is_ready_for_payment_choice(receipt) and receipt.status != ReceiptStatus.payment_draft_failed:
+                await callback.answer("Рахунок ще не готовий до створення платежу.", show_alert=True)
+                return
 
-        lines.append("")
-        if receipt.status == ReceiptStatus.dry_run_created:
-            lines.append("Створено локальну dry-run чернетку. До банку документ не надсилався.")
-        else:
-            lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
-        await message.answer("\n".join(lines))
+            await callback.answer("Створюю чернетку платежу...")
+            receipt = pipeline.create_payment_draft_for_receipt(db, receipt, provider)
+
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer(_render_receipt_result(receipt))
 
     @dp.message()
     async def fallback(message: Message) -> None:

@@ -14,7 +14,7 @@ Docker-проект для Telegram-бота, который:
 - PostgreSQL + SQLAlchemy модели `receipts`, `payment_drafts`, `audit_logs`.
 - Сохранение изображений в volume.
 - Vision/OCR-проверка счета на оплату через OpenAI Responses API.
-- Автоматический переход к созданию черновика платежа.
+- Выбор банка в Telegram после распознавания счета: `Приват24` или monobank.
 - Dry-run режим для банковских адаптеров, чтобы можно было поднять проект до подключения реального API банка.
 - Connector-слой для банков, CRM и Telegram-границы бота.
 - Белый список `ALLOWED_USER_IDS`.
@@ -44,7 +44,7 @@ Docker-проект для Telegram-бота, который:
 
 ## Ограничение текущего MVP
 
-Интеграция с банками вынесена в отдельные адаптеры и выбирается через `PAYMENT_PROVIDER`.
+Интеграция с банками вынесена в отдельные адаптеры. После успешной preflight-проверки бот спрашивает в Telegram, откуда платить: `Приват24` или monobank. `PAYMENT_PROVIDER` остается провайдером по умолчанию для служебных режимов и обратной совместимости.
 
 Для `Privat24` используется официальный `Автоклієнт API`: `POST https://acp.privatbank.ua/api/proxy/payment/create`, а подпись идет отдельным шагом через `GET /api/proxy/payment/get` и `POST /api/proxy/payment/add-sign`.
 

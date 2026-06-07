@@ -75,7 +75,7 @@ class Privat24Client:
         if beneficiary_bank_name:
             payload["recipient_ifi_text"] = beneficiary_bank_name
 
-        if self.settings.privat24_dry_run or not self.settings.privat24_api_base_url or not self.settings.privat24_api_token:
+        if self.settings.payment_dry_run_for("privat24") or not self.settings.privat24_api_base_url or not self.settings.privat24_api_token:
             return PaymentDraftResult(
                 created=True,
                 provider_payment_id=f"dry-run-{uuid4()}",

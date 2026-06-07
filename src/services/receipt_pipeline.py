@@ -18,11 +18,12 @@ from .vision import ReceiptVisionService
 
 
 class ReceiptPipeline:
+    PAYMENT_PROVIDERS = ("privat24", "monobank")
+
     def __init__(self) -> None:
         self.settings = get_settings()
         self.vision = ReceiptVisionService()
         self.text_extractor = DocumentTextExtractor()
-        self.payment_connector = build_payment_connector(self.settings)
         self.crm_connector = build_crm_connector(self.settings)
 
     @staticmethod
@@ -147,8 +148,8 @@ class ReceiptPipeline:
             **receipt.validation_payload,
             "payment_purpose_final": preflight.normalized_purpose,
             "preflight_errors": preflight.errors,
-            "payment_provider": self.settings.payment_provider,
-            "execution_mode": "dry_run" if self.settings.payment_dry_run else "live",
+            "payment_ready": preflight.ok,
+            "available_payment_providers": list(self.PAYMENT_PROVIDERS),
         }
         db.add(receipt)
         db.commit()
@@ -173,16 +174,79 @@ class ReceiptPipeline:
             action_type=ActionType.payment_draft_requested,
             telegram_user_id=telegram_user_id,
             receipt_id=receipt.id,
+            message="Payment provider selection requested",
+            payload={
+                "purpose": preflight.normalized_purpose,
+                "procurement_category": PaymentPurposeBuilder.infer_category(validation),
+                "available_payment_providers": list(self.PAYMENT_PROVIDERS),
+            },
+        )
+        return receipt
+
+    def create_payment_draft_for_receipt(self, db: Session, receipt: Receipt, provider: str) -> Receipt:
+        provider_name = provider.lower()
+        if provider_name not in self.PAYMENT_PROVIDERS:
+            raise ValueError("unsupported_payment_provider")
+        if receipt.status in {ReceiptStatus.dry_run_created, ReceiptStatus.bank_created}:
+            return receipt
+        if not (receipt.validation_payload or {}).get("payment_ready"):
+            raise ValueError("receipt_is_not_ready_for_payment")
+
+        validation = ReceiptValidationResult(
+            readable=True,
+            summary=receipt.validation_summary or "",
+            supplier_name=receipt.extracted_supplier_name,
+            supplier_tax_id=receipt.extracted_supplier_tax_id,
+            supplier_iban=receipt.extracted_supplier_iban,
+            supplier_bank_name=receipt.extracted_supplier_bank_name,
+            supplier_mfo=receipt.extracted_supplier_mfo,
+            invoice_number=receipt.extracted_invoice_number,
+            invoice_date=receipt.extracted_invoice_date,
+            amount=receipt.extracted_amount,
+            currency=receipt.extracted_currency,
+            procurement_category=receipt.validation_payload.get("procurement_category"),
+            payment_purpose=receipt.validation_payload.get("payment_purpose"),
+            missing_fields=receipt.validation_payload.get("missing_fields") or [],
+            raw_text=receipt.validation_payload.get("raw_text"),
+        )
+        purpose = receipt.validation_payload.get("payment_purpose_final") or PaymentPurposeBuilder.build(validation)
+        preflight = run_preflight(validation, purpose)
+        if not preflight.ok:
+            receipt.status = ReceiptStatus.requires_manual_review
+            receipt.validation_payload = {
+                **(receipt.validation_payload or {}),
+                "preflight_errors": preflight.errors,
+                "payment_ready": False,
+            }
+            db.add(receipt)
+            db.commit()
+            write_audit_log(
+                db,
+                action_type=ActionType.preflight_failed,
+                telegram_user_id=receipt.telegram_user_id,
+                receipt_id=receipt.id,
+                message="Payment preflight validation failed before provider draft",
+                payload={"errors": preflight.errors, "payment_provider": provider_name},
+            )
+            return receipt
+
+        payment_connector = build_payment_connector(self.settings, provider=provider_name)
+        payment_dry_run = self.settings.payment_dry_run_for(provider_name)
+        write_audit_log(
+            db,
+            action_type=ActionType.payment_draft_requested,
+            telegram_user_id=receipt.telegram_user_id,
+            receipt_id=receipt.id,
             message="Payment draft creation requested",
             payload={
                 "purpose": preflight.normalized_purpose,
                 "procurement_category": PaymentPurposeBuilder.infer_category(validation),
-                "payment_provider": self.settings.payment_provider,
-                "execution_mode": "dry_run" if self.settings.payment_dry_run else "live",
+                "payment_provider": provider_name,
+                "execution_mode": "dry_run" if payment_dry_run else "live",
             },
         )
         try:
-            draft_result = self.payment_connector.create_payment_draft(
+            draft_result = payment_connector.create_payment_draft(
                 document_number=self._document_number(receipt.id),
                 beneficiary_name=preflight.normalized_supplier_name,
                 beneficiary_tax_id=preflight.normalized_supplier_tax_id,
@@ -196,15 +260,17 @@ class ReceiptPipeline:
         except Exception as exc:
             receipt.status = ReceiptStatus.payment_draft_failed
             receipt.validation_payload = {
-                **receipt.validation_payload,
+                **(receipt.validation_payload or {}),
                 "payment_create_error": str(exc),
+                "payment_provider": provider_name,
+                "execution_mode": "dry_run" if payment_dry_run else "live",
             }
             db.add(receipt)
             db.commit()
             write_audit_log(
                 db,
                 action_type=ActionType.payment_draft_failed,
-                telegram_user_id=telegram_user_id,
+                telegram_user_id=receipt.telegram_user_id,
                 receipt_id=receipt.id,
                 message="Payment draft creation failed",
                 payload={
@@ -212,16 +278,17 @@ class ReceiptPipeline:
                     "document_number": self._document_number(receipt.id),
                     "beneficiary_tax_id": preflight.normalized_supplier_tax_id,
                     "beneficiary_iban": preflight.normalized_supplier_iban,
+                    "payment_provider": provider_name,
                 },
             )
             return receipt
 
         payment_draft = PaymentDraft(
             receipt_id=receipt.id,
-            provider_name=self.payment_connector.provider_name,
+            provider_name=payment_connector.provider_name,
             provider_payment_id=draft_result.provider_payment_id,
             provider_pack_id=draft_result.provider_pack_id,
-            source_account=self.payment_connector.source_account(),
+            source_account=payment_connector.source_account(),
             beneficiary_name=preflight.normalized_supplier_name,
             beneficiary_tax_id=preflight.normalized_supplier_tax_id,
             beneficiary_iban=preflight.normalized_supplier_iban,
@@ -234,8 +301,13 @@ class ReceiptPipeline:
             provider_payload=draft_result.payload,
         )
         db.add(payment_draft)
+        receipt.validation_payload = {
+            **(receipt.validation_payload or {}),
+            "payment_provider": provider_name,
+            "execution_mode": "dry_run" if payment_dry_run else "live",
+        }
         if draft_result.created:
-            receipt.status = ReceiptStatus.dry_run_created if self.settings.payment_dry_run else ReceiptStatus.bank_created
+            receipt.status = ReceiptStatus.dry_run_created if payment_dry_run else ReceiptStatus.bank_created
         else:
             receipt.status = ReceiptStatus.payment_draft_failed
         db.add(receipt)
@@ -245,12 +317,12 @@ class ReceiptPipeline:
         write_audit_log(
             db,
             action_type=ActionType.payment_draft_created if draft_result.created else ActionType.payment_draft_failed,
-            telegram_user_id=telegram_user_id,
+            telegram_user_id=receipt.telegram_user_id,
             receipt_id=receipt.id,
             message="Payment draft processed",
             payload=draft_result.model_dump(mode="json"),
         )
-        self._sync_crm(db, telegram_user_id, receipt, payment_draft)
+        self._sync_crm(db, receipt.telegram_user_id, receipt, payment_draft)
         return receipt
 
     def _sync_crm(

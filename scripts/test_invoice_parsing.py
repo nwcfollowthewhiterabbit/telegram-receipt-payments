@@ -11,6 +11,11 @@ from src.services.receipt_pipeline import ReceiptPipeline
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch test invoice parsing on local image files.")
     parser.add_argument("path", help="Path to an image file or directory with invoice images")
+    parser.add_argument(
+        "--create-draft-provider",
+        choices=["privat24", "monobank"],
+        help="Create a payment draft for each ready invoice with the selected provider.",
+    )
     args = parser.parse_args()
 
     root = Path(args.path)
@@ -30,6 +35,8 @@ def main() -> None:
     with SessionLocal() as db:
         for file_path in files:
             receipt = pipeline.process_local_file(db, str(file_path))
+            if args.create_draft_provider and receipt.validation_payload.get("payment_ready"):
+                receipt = pipeline.create_payment_draft_for_receipt(db, receipt, args.create_draft_provider)
             print(json.dumps(
                 {
                     "file": file_path.name,

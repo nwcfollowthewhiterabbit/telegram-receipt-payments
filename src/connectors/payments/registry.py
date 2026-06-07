@@ -6,9 +6,10 @@ from src.config import Settings
 from src.connectors.payments.base import PaymentConnector
 
 
-def build_payment_connector(settings: Settings) -> PaymentConnector:
-    if settings.payment_provider == "monobank":
+def build_payment_connector(settings: Settings, provider: str | None = None) -> PaymentConnector:
+    provider_name = (provider or settings.payment_provider).lower()
+    if provider_name == "monobank":
         return MonobankClient()
-    if settings.payment_provider == "privat24":
+    if provider_name == "privat24":
         return Privat24Client()
-    raise RuntimeError(f"Unsupported payment provider: {settings.payment_provider}")
+    raise RuntimeError(f"Unsupported payment provider: {provider_name}")

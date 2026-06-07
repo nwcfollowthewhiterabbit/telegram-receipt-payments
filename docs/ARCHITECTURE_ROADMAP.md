@@ -21,7 +21,7 @@ Main layers:
 - `src/services/receipt_pipeline.py` is the orchestration/use-case layer.
 - `src/services/vision.py` extracts invoice fields with OpenAI.
 - `src/services/payment_preflight.py` normalizes and validates payment requisites.
-- `src/connectors/payments/registry.py` selects the active payment connector.
+- `src/connectors/payments/registry.py` builds the selected payment connector.
 - `src/connectors/crm/registry.py` selects the active CRM connector.
 - `src/connectors/communication/registry.py` selects the active communication adapter.
 - `src/connectors/communication/telegram.py` stores Telegram files and converts Telegram messages into transport-neutral incoming files.
@@ -33,7 +33,7 @@ Main layers:
 
 Runtime selection is controlled by environment variables:
 
-- `PAYMENT_PROVIDER=privat24|monobank`
+- `PAYMENT_PROVIDER=privat24|monobank` as the default provider for compatibility; Telegram users choose Privat24 or Monobank per ready invoice.
 - `PAYMENT_DRY_RUN=` optional override for all payment connectors
 - `CRM_PROVIDER=none|terrasoft_mssql`
 - `CRM_DRY_RUN=true|false`
@@ -41,8 +41,8 @@ Runtime selection is controlled by environment variables:
 
 Current production-like configuration on the server:
 
-- Payment provider: `monobank`
-- Payment mode: live
+- Default payment provider: `monobank`
+- Payment mode: provider-specific live/dry-run, selected per invoice in Telegram
 - CRM provider: `terrasoft_mssql`
 - CRM mode: dry-run
 

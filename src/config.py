@@ -130,9 +130,12 @@ class Settings:
 
     @property
     def payment_dry_run(self) -> bool:
+        return self.payment_dry_run_for(self.payment_provider)
+
+    def payment_dry_run_for(self, provider: str) -> bool:
         if self.payment_dry_run_override is not None:
             return _parse_bool(self.payment_dry_run_override, True)
-        if self.payment_provider == "monobank":
+        if provider == "monobank":
             return self.monobank_dry_run
         return self.privat24_dry_run
 

@@ -124,7 +124,7 @@ class MonobankClient:
             "externalReference": document_number,
         }
 
-        if self.settings.payment_dry_run or not self.settings.monobank_api_token:
+        if self.settings.payment_dry_run_for("monobank") or not self.settings.monobank_api_token:
             return PaymentDraftResult(
                 created=True,
                 provider_payment_id=f"dry-run-{uuid4()}",
