@@ -31,6 +31,13 @@ class PaymentDraftResult(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
+class PaymentDraftValidationResult(BaseModel):
+    ok: bool
+    summary: str
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class CrmSyncResult(BaseModel):
     synced: bool
     provider_name: str

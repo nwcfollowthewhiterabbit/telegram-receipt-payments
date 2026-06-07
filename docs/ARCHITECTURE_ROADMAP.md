@@ -21,6 +21,7 @@ Main layers:
 - `src/services/receipt_pipeline.py` is the orchestration/use-case layer.
 - `src/services/vision.py` extracts invoice fields with OpenAI.
 - `src/services/payment_preflight.py` normalizes and validates payment requisites.
+- `src/services/payment_draft_validation.py` validates final payment details before any bank API request.
 - `src/connectors/payments/registry.py` builds the selected payment connector.
 - `src/connectors/crm/registry.py` selects the active CRM connector.
 - `src/connectors/communication/registry.py` selects the active communication adapter.
@@ -60,15 +61,19 @@ Current production-like configuration on the server:
 
    External systems can fail. Every invoice must keep local status, parsed fields, provider payloads, and audit events.
 
-4. CRM cashflow writes are operation-creation commands, not state synchronization.
+4. Bank API calls must pass the final payment validation contour.
+
+   The bot must validate the final beneficiary, IBAN, amount, currency, purpose, and provider-specific requirements after a Telegram bank choice and before calling a bank connector.
+
+5. CRM cashflow writes are operation-creation commands, not state synchronization.
 
    Each invoice processing attempt may intentionally create a new client-bank payment draft and a new Terrasoft cashflow operation. Do not upsert repeated attempts into a previous operation.
 
-5. Dry-run modes are mandatory for new connectors.
+6. Dry-run modes are mandatory for new connectors.
 
    Any new bank, CRM, or notification connector must support safe validation without writing to external systems.
 
-6. Secrets stay in `.env` only.
+7. Secrets stay in `.env` only.
 
    Tokens, SQL credentials, IBANs, and Telegram tokens must not be committed or printed in logs.
 

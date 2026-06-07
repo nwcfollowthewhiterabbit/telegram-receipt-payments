@@ -11,9 +11,10 @@ from src.connectors.payments.registry import build_payment_connector
 from src.db.models import ActionType, PaymentDraft, Receipt, ReceiptStatus
 from .audit import write_audit_log
 from .document_text import DocumentTextExtractor
+from .payment_draft_validation import PaymentDraftValidationService
 from .payment_preflight import run_preflight
 from .purpose_builder import PaymentPurposeBuilder
-from .schemas import ReceiptValidationResult
+from .schemas import PaymentDraftValidationResult, ReceiptValidationResult
 from .vision import ReceiptVisionService
 
 
@@ -24,6 +25,7 @@ class ReceiptPipeline:
         self.settings = get_settings()
         self.vision = ReceiptVisionService()
         self.text_extractor = DocumentTextExtractor()
+        self.payment_validator = PaymentDraftValidationService()
         self.crm_connector = build_crm_connector(self.settings)
 
     @staticmethod
@@ -232,6 +234,67 @@ class ReceiptPipeline:
 
         payment_connector = build_payment_connector(self.settings, provider=provider_name)
         payment_dry_run = self.settings.payment_dry_run_for(provider_name)
+        payment_payload = {
+            "provider": provider_name,
+            "document_number": self._document_number(receipt.id),
+            "source_account": payment_connector.source_account(),
+            "beneficiary_name": preflight.normalized_supplier_name,
+            "beneficiary_tax_id": preflight.normalized_supplier_tax_id,
+            "beneficiary_iban": preflight.normalized_supplier_iban,
+            "beneficiary_bank_name": preflight.normalized_supplier_bank_name,
+            "beneficiary_mfo": validation.supplier_mfo,
+            "amount": str(validation.amount),
+            "currency": validation.currency or self.settings.default_currency,
+            "purpose": preflight.normalized_purpose,
+        }
+        try:
+            payment_validation = self.payment_validator.validate(validation, payment_payload, provider_name)
+        except Exception as exc:
+            payment_validation = PaymentDraftValidationResult(
+                ok=False,
+                summary="Не вдалося виконати контрольну перевірку платежу.",
+                errors=["payment_validation_error"],
+                warnings=[str(exc)],
+            )
+
+        receipt.validation_payload = {
+            **(receipt.validation_payload or {}),
+            "payment_validation": payment_validation.model_dump(mode="json"),
+        }
+        db.add(receipt)
+        db.commit()
+        if not payment_validation.ok:
+            receipt.status = ReceiptStatus.requires_manual_review
+            receipt.validation_payload = {
+                **(receipt.validation_payload or {}),
+                "payment_ready": False,
+            }
+            db.add(receipt)
+            db.commit()
+            write_audit_log(
+                db,
+                action_type=ActionType.preflight_failed,
+                telegram_user_id=receipt.telegram_user_id,
+                receipt_id=receipt.id,
+                message="Payment draft validation failed before bank request",
+                payload={
+                    "payment_provider": provider_name,
+                    "validation": payment_validation.model_dump(mode="json"),
+                },
+            )
+            return receipt
+
+        write_audit_log(
+            db,
+            action_type=ActionType.validation_completed,
+            telegram_user_id=receipt.telegram_user_id,
+            receipt_id=receipt.id,
+            message="Payment draft validation completed",
+            payload={
+                "payment_provider": provider_name,
+                "validation": payment_validation.model_dump(mode="json"),
+            },
+        )
         write_audit_log(
             db,
             action_type=ActionType.payment_draft_requested,
