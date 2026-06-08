@@ -86,6 +86,20 @@ def _is_ready_for_payment_choice(receipt: Receipt) -> bool:
     return receipt.status == ReceiptStatus.validated and bool((receipt.validation_payload or {}).get("payment_ready"))
 
 
+def _receipt_status_label(receipt: Receipt) -> str:
+    if _is_ready_for_payment_choice(receipt):
+        return "очікує вибору банку, платіж ще не створено"
+    if receipt.status == ReceiptStatus.dry_run_created:
+        return "dry-run чернетку створено"
+    if receipt.status == ReceiptStatus.bank_created:
+        return "банківську чернетку створено"
+    if receipt.status == ReceiptStatus.payment_draft_failed:
+        return "помилка створення чернетки"
+    if receipt.status == ReceiptStatus.requires_manual_review:
+        return "потрібна ручна перевірка"
+    return receipt.status.value
+
+
 def _render_receipt_result(receipt) -> str:
     validation_view = ReceiptValidationResult(
         readable=True,
@@ -118,7 +132,7 @@ def _render_receipt_result(receipt) -> str:
         f"Сума: {receipt.extracted_amount or 'не визначено'} {receipt.extracted_currency or ''}",
         f"Категорія закупівлі: {PaymentPurposeBuilder.infer_category(validation_view)}",
         f"Призначення: {built_purpose}",
-        f"Статус: {receipt.status.value}",
+        f"Статус: {_receipt_status_label(receipt)}",
     ]
     missing_fields = receipt.validation_payload.get("missing_fields") or []
     if missing_fields:
@@ -151,7 +165,8 @@ async def _answer_receipt_result(message: Message, receipt: Receipt) -> None:
     lines = _render_receipt_result(receipt).splitlines()
     lines.append("")
     if _is_ready_for_payment_choice(receipt):
-        lines.append("Оберіть, звідки платити:")
+        lines.append("Платіж ще НЕ створено і НЕ відправлено в банк.")
+        lines.append("Щоб створити чернетку платежу, натисніть банк нижче:")
         await message.answer("\n".join(lines), reply_markup=_payment_choice_keyboard(receipt.id))
         return
 
