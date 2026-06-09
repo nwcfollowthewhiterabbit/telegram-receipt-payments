@@ -139,6 +139,9 @@ def _render_receipt_result(receipt) -> str:
         lines.append(f"Відсутнє або нечитабельне: {', '.join(missing_fields)}")
     if preflight_errors:
         lines.append(f"Помилки preflight: {', '.join(preflight_errors)}")
+    payment_create_error = receipt.validation_payload.get("payment_create_error")
+    if payment_create_error:
+        lines.append(f"Помилка створення платежу: {payment_create_error}")
     payment_validation = receipt.validation_payload.get("payment_validation") or {}
     payment_validation_errors = payment_validation.get("errors") or []
     if payment_validation_errors:
