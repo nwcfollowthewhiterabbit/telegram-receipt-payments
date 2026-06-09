@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -8,6 +9,7 @@ from openai import OpenAI
 
 from src.config import get_settings
 from src.services.payment_preflight import is_valid_iban, normalize_iban, normalize_text
+from src.services.purpose_builder import PaymentPurposeBuilder
 from src.services.schemas import PaymentDraftValidationResult, ReceiptValidationResult
 
 
@@ -97,6 +99,16 @@ class PaymentDraftValidationService:
             errors.append("missing_payment_purpose")
         elif len(purpose) < 12:
             warnings.append("short_payment_purpose")
+        if re.search(r"\b20\d{2}-\d{2}-\d{2}\b", purpose or ""):
+            errors.append("payment_purpose_date_not_european_format")
+
+        required_prefix = PaymentPurposeBuilder._extract_required_prefix(validation.raw_text)
+        if required_prefix and not (purpose or "").startswith(required_prefix):
+            errors.append("payment_purpose_missing_required_prefix")
+
+        vat_suffix = PaymentPurposeBuilder._extract_vat_suffix(validation.raw_text)
+        if vat_suffix and "пдв" not in (purpose or "").lower():
+            errors.append("payment_purpose_missing_vat")
 
         return PaymentDraftValidationResult(
             ok=not errors,
