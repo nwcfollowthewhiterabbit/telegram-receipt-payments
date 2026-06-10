@@ -49,11 +49,11 @@ class MonobankClient:
     def _minor_units(amount: Decimal) -> int:
         return int((amount * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    def _request(self, method: str, path: str, headers: dict[str, str] | None = None, **kwargs: Any) -> httpx.Response:
         response = httpx.request(
             method,
             f"{self.settings.monobank_api_base_url.rstrip('/')}{path}",
-            headers=self._headers(),
+            headers={**self._headers(), **(headers or {})},
             timeout=30.0,
             **kwargs,
         )
@@ -134,7 +134,12 @@ class MonobankClient:
             )
 
         payload["senderIban"] = self._resolve_sender_iban()
-        data = self._request("POST", "/ext/v1/payment/prepare", json=payload).json()
+        data = self._request(
+            "POST",
+            "/ext/v1/payment/prepare",
+            headers={"idempotency-key": f"receipt-paybot-{document_number}"},
+            json=payload,
+        ).json()
         return PaymentDraftResult(
             created=True,
             provider_payment_id=data.get("id"),
