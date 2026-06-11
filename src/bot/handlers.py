@@ -148,6 +148,12 @@ def _render_receipt_result(receipt) -> str:
         lines.append(f"Помилки контрольної перевірки: {', '.join(payment_validation_errors)}")
     elif payment_validation.get("summary"):
         lines.append(f"Контрольна перевірка: {payment_validation['summary']}")
+    if receipt.validation_payload.get("crm_sync_status") == "crm_synced":
+        cf_number = receipt.validation_payload.get("crm_cf_number")
+        if cf_number:
+            lines.append(f"CRM операція: {cf_number}")
+        if receipt.validation_payload.get("crm_recipient_found") is False:
+            lines.append("CRM: контрагента не знайдено за кодом. Потрібно додати контрагента або заповнити код у CRM.")
     return "\n".join(lines)
 
 

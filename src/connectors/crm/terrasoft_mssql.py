@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from decimal import Decimal
+import calendar
 from uuid import uuid4
 
 from sqlalchemy import create_engine, text
@@ -47,6 +48,7 @@ class TerrasoftMssqlConnector:
             payload["recipient_id"] = recipient["id"] if recipient else None
             payload["recipient_match"] = recipient
             payload["cf_number"] = self._next_cf_number(connection)
+            payload["period_id"] = self._ensure_period_id(connection, payload["estimated_date"])
             connection.execute(*self._build_cashflow_insert(payload))
 
         return CrmSyncResult(
@@ -60,6 +62,9 @@ class TerrasoftMssqlConnector:
                 "id": payload["id"],
                 "external_key": payload["external_key"],
                 "recipient_match": payload["recipient_match"],
+                "recipient_found": bool(payload["recipient_match"]),
+                "cf_number": payload["cf_number"],
+                "period_id": payload["period_id"],
             },
         )
 
@@ -90,10 +95,10 @@ class TerrasoftMssqlConnector:
             "payer_id": PAYER_RENTALL_ACCOUNT_ID,
             "recipient_id": None,
             "status_id": self._status_id(receipt, payment_draft),
-            "period_id": self._period_id_for_date(estimated_date),
+            "period_id": None,
             "currency_id": CURRENCY_UAH_ID,
             "estimated_date": estimated_date,
-            "actual_date": None,
+            "actual_date": estimated_date,
             "subject": self._subject(receipt, payment_draft),
             "currency_rate": Decimal("1.0000"),
             "amount": amount,
@@ -123,11 +128,6 @@ class TerrasoftMssqlConnector:
                 except ValueError:
                     pass
         return dt.datetime.combine(dt.date.today(), dt.time.min)
-
-    @staticmethod
-    def _period_id_for_date(value: dt.datetime) -> str | None:
-        # Existing periods are monthly records named MM.YYYY. The lookup is resolved by SQL during insert.
-        return value.strftime("%m.%Y")
 
     @staticmethod
     def _subject(receipt: Receipt, payment_draft: PaymentDraft | None) -> str:
@@ -184,6 +184,45 @@ class TerrasoftMssqlConnector:
         )
         return dict(row) if row else None
 
+    def _ensure_period_id(self, connection, value: dt.datetime) -> str:
+        period_name = value.strftime("%m.%Y")
+        row = connection.execute(
+            text(
+                """
+                SELECT TOP 1 CONVERT(nvarchar(36), ID) AS id
+                FROM dbo.tbl_Period
+                WHERE Name = :period_name
+                ORDER BY StartDate DESC
+                """
+            ),
+            {"period_name": period_name},
+        ).mappings().first()
+        if row:
+            return str(row["id"])
+
+        period_id = str(uuid4())
+        start_date = dt.datetime.combine(value.date().replace(day=1), dt.time.min)
+        last_day = calendar.monthrange(value.year, value.month)[1]
+        due_date = dt.datetime.combine(value.date().replace(day=last_day), dt.time.min)
+        now = dt.datetime.utcnow()
+        connection.execute(
+            text(
+                """
+                INSERT INTO dbo.tbl_Period (ID, CreatedOn, ModifiedOn, Name, StartDate, DueDate)
+                VALUES (CONVERT(uniqueidentifier, :id), :created_on, :modified_on, :name, :start_date, :due_date)
+                """
+            ),
+            {
+                "id": period_id,
+                "created_on": now,
+                "modified_on": now,
+                "name": period_name,
+                "start_date": start_date,
+                "due_date": due_date,
+            },
+        )
+        return period_id
+
     def _next_cf_number(self, connection) -> str:
         row = connection.execute(
             text(
@@ -199,9 +238,6 @@ class TerrasoftMssqlConnector:
     def _build_cashflow_insert(self, payload: dict) -> tuple:
         query = text(
             """
-            DECLARE @PeriodID uniqueidentifier;
-            SELECT TOP 1 @PeriodID = ID FROM dbo.tbl_Period WHERE Name = :period_name ORDER BY StartDate DESC;
-
             INSERT INTO dbo.tbl_Cashflow (
                 ID, CreatedOn, ModifiedOn, CashAccountID, TypeID, RecipientID, PayerID, StatusID, PeriodID,
                 CurrencyID, EstimatedDate, ActualDate, Subject, CurrencyRate, Amount, BasicAmount, OwnerID,
@@ -211,11 +247,11 @@ class TerrasoftMssqlConnector:
                 CONVERT(uniqueidentifier, :id), :created_on, :modified_on, CONVERT(uniqueidentifier, :cash_account_id),
                 CONVERT(uniqueidentifier, :type_id),
                 CASE WHEN :recipient_id IS NULL THEN NULL ELSE CONVERT(uniqueidentifier, :recipient_id) END,
-                CONVERT(uniqueidentifier, :payer_id), CONVERT(uniqueidentifier, :status_id), @PeriodID,
+                CONVERT(uniqueidentifier, :payer_id), CONVERT(uniqueidentifier, :status_id), CONVERT(uniqueidentifier, :period_id),
                 CONVERT(uniqueidentifier, :currency_id), :estimated_date, :actual_date, :subject, :currency_rate,
                 :amount, :basic_amount, CONVERT(uniqueidentifier, :owner_id), :use_as_cashflow, :use_as_pandl,
                 :autocalc_amount, :cf_number, :comments_payer, :external_key
             );
             """
         )
-        return query, {**payload, "period_name": payload["period_id"]}
+        return query, payload

@@ -419,6 +419,9 @@ class ReceiptPipeline:
             "crm_provider": crm_result.provider_name,
             "crm_sync_status": crm_result.status,
             "crm_external_id": crm_result.external_id,
+            "crm_recipient_found": crm_result.payload.get("recipient_found"),
+            "crm_recipient_match": crm_result.payload.get("recipient_match"),
+            "crm_cf_number": crm_result.payload.get("cf_number"),
         }
         db.add(receipt)
         db.commit()
