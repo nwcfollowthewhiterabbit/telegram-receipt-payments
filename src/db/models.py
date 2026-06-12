@@ -42,7 +42,7 @@ class Receipt(Base):
     telegram_file_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     original_filename: Mapped[str] = mapped_column(String(255))
     storage_path: Mapped[str] = mapped_column(String(512))
-    mime_type: Mapped[str] = mapped_column(String(64), default="image/jpeg")
+    mime_type: Mapped[str] = mapped_column(String(255), default="image/jpeg")
     status: Mapped[ReceiptStatus] = mapped_column(Enum(ReceiptStatus), default=ReceiptStatus.uploaded, index=True)
     extracted_supplier_name: Mapped[str | None] = mapped_column(String(255))
     extracted_supplier_tax_id: Mapped[str | None] = mapped_column(String(32))

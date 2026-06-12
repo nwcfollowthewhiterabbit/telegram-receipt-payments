@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -22,6 +24,7 @@ from src.services.receipt_pipeline import ReceiptPipeline
 from src.services.schemas import ReceiptValidationResult
 
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 pipeline = ReceiptPipeline()
 telegram_adapter = build_communication_adapter(settings)
@@ -278,9 +281,14 @@ def register_handlers(dp: Dispatcher) -> None:
             return
 
         await message.answer("Фото отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
-        incoming_file = await telegram_adapter.save_photo(message.bot, message)
-        with SessionLocal() as db:
-            receipt = pipeline.process_incoming_file(db, incoming_file)
+        try:
+            incoming_file = await telegram_adapter.save_photo(message.bot, message)
+            with SessionLocal() as db:
+                receipt = pipeline.process_incoming_file(db, incoming_file)
+        except Exception:
+            logger.exception("Failed to process Telegram photo upload")
+            await message.answer("Не вдалося обробити фото. Спробуйте ще раз або надішліть рахунок як PDF/XLS/XLSX.")
+            return
 
         await _answer_receipt_result(message, receipt)
 
@@ -307,6 +315,10 @@ def register_handlers(dp: Dispatcher) -> None:
                 receipt = pipeline.process_incoming_file(db, incoming_file)
         except ValueError:
             await message.answer("Підтримуються лише фото, PDF, XLS і XLSX.")
+            return
+        except Exception:
+            logger.exception("Failed to process Telegram document upload")
+            await message.answer("Не вдалося обробити файл. Спробуйте ще раз або надішліть інший PDF/XLS/XLSX.")
             return
 
         await _answer_receipt_result(message, receipt)
