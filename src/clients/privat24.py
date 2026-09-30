@@ -31,13 +31,11 @@ class Privat24Client:
     @staticmethod
     def normalize_nceo(value: str | None) -> str:
         if not value:
-            return "0000000000"
+            raise RuntimeError("Privat24 requires recipient EDRPOU/IPN")
         digits = "".join(ch for ch in value if ch.isdigit())
         if 8 <= len(digits) <= 10:
             return digits
-        if len(digits) > 10:
-            return digits[:8]
-        return digits or "0000000000"
+        raise RuntimeError(f"Invalid recipient EDRPOU/IPN length: {len(digits)}")
 
     def create_payment_draft(
         self,

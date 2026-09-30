@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
@@ -12,7 +14,7 @@ from src.db.models import ActionType, PaymentDraft, Receipt, ReceiptStatus
 from .audit import write_audit_log
 from .document_text import DocumentTextExtractor
 from .payment_draft_validation import PaymentDraftValidationService
-from .payment_preflight import run_preflight
+from .payment_preflight import is_valid_iban, normalize_iban, normalize_tax_id, normalize_text, run_preflight
 from .purpose_builder import PaymentPurposeBuilder
 from .schemas import PaymentDraftValidationResult, ReceiptValidationResult
 from .vision import ReceiptVisionService
@@ -41,6 +43,74 @@ class ReceiptPipeline:
     @staticmethod
     def _document_number(receipt_id: int) -> str:
         return f"RCPT{receipt_id:04d}"
+
+    @staticmethod
+    def _retry_file_id(telegram_file_id: str) -> str:
+        suffix = f":retry:{uuid4().hex[:12]}"
+        return f"{telegram_file_id[: 255 - len(suffix)]}{suffix}"
+
+    @staticmethod
+    def _supplier_name_key(value: str | None) -> str | None:
+        normalized = normalize_text(value)
+        return normalized.casefold() if normalized else None
+
+    def _enrich_from_history(
+        self,
+        db: Session,
+        receipt_id: int,
+        validation: ReceiptValidationResult,
+        preflight_errors: list[str],
+    ) -> tuple[ReceiptValidationResult, dict]:
+        if not {"missing_supplier_tax_id", "invalid_supplier_iban", "missing_supplier_iban"}.intersection(
+            preflight_errors
+        ):
+            return validation, {}
+
+        supplier_name_key = self._supplier_name_key(validation.supplier_name)
+        current_tax_id = normalize_tax_id(validation.supplier_tax_id)
+        current_iban = normalize_iban(validation.supplier_iban)
+        current_iban_is_valid = is_valid_iban(current_iban)
+        if not supplier_name_key and not current_tax_id:
+            return validation, {}
+
+        tax_ids: set[str] = set()
+        ibans: set[str] = set()
+        matched_records = 0
+        drafts = (
+            db.query(PaymentDraft)
+            .join(Receipt)
+            .filter(Receipt.id != receipt_id)
+            .order_by(PaymentDraft.created_at.desc())
+            .limit(200)
+            .all()
+        )
+        for draft in drafts:
+            draft_tax_id = normalize_tax_id(draft.beneficiary_tax_id or draft.receipt.extracted_supplier_tax_id)
+            draft_iban = normalize_iban(draft.beneficiary_iban or draft.receipt.extracted_supplier_iban)
+            draft_name_key = self._supplier_name_key(draft.beneficiary_name or draft.receipt.extracted_supplier_name)
+            if not ((current_tax_id and draft_tax_id == current_tax_id) or (supplier_name_key and draft_name_key == supplier_name_key)):
+                continue
+
+            matched_records += 1
+            if draft_tax_id:
+                tax_ids.add(draft_tax_id)
+            if draft_iban and is_valid_iban(draft_iban):
+                ibans.add(draft_iban)
+
+        updates: dict[str, str] = {}
+        if not current_tax_id and len(tax_ids) == 1:
+            updates["supplier_tax_id"] = next(iter(tax_ids))
+        if not current_iban_is_valid and len(ibans) == 1:
+            updates["supplier_iban"] = next(iter(ibans))
+        if not updates:
+            return validation, {}
+
+        enrichment = {
+            "source": "payment_draft_history",
+            "matched_records": matched_records,
+            "updated_fields": sorted(updates),
+        }
+        return validation.model_copy(update=updates), enrichment
 
     def process_incoming_file(self, db: Session, incoming_file: StoredIncomingFile) -> Receipt:
         return self._process_saved_file(
@@ -86,9 +156,10 @@ class ReceiptPipeline:
         storage_path: Path,
         mime_type: str,
     ) -> Receipt:
-        existing = db.query(Receipt).filter(Receipt.telegram_file_id == telegram_file_id).first()
-        if existing:
-            return existing
+        original_telegram_file_id = telegram_file_id
+        duplicate_of = db.query(Receipt.id).filter(Receipt.telegram_file_id == telegram_file_id).scalar()
+        if duplicate_of:
+            telegram_file_id = self._retry_file_id(telegram_file_id)
 
         receipt = Receipt(
             telegram_user_id=telegram_user_id,
@@ -108,7 +179,12 @@ class ReceiptPipeline:
             telegram_user_id=telegram_user_id,
             receipt_id=receipt.id,
             message="Source document uploaded",
-            payload={"path": str(storage_path), "mime_type": mime_type},
+            payload={
+                "path": str(storage_path),
+                "mime_type": mime_type,
+                "original_telegram_file_id": original_telegram_file_id,
+                "duplicate_of_receipt_id": duplicate_of,
+            },
         )
 
         validation = self._validate_saved_file(storage_path, mime_type, original_filename)
@@ -140,14 +216,22 @@ class ReceiptPipeline:
         if not self._has_required_invoice_fields(validation):
             return receipt
 
-        purpose = PaymentPurposeBuilder.build(validation)
+        purpose = PaymentPurposeBuilder.build_for_payment(validation)
         preflight = run_preflight(validation, purpose)
+        history_enrichment: dict = {}
+        if not preflight.ok:
+            validation, history_enrichment = self._enrich_from_history(db, receipt.id, validation, preflight.errors)
+            if history_enrichment:
+                purpose = PaymentPurposeBuilder.build_for_payment(validation)
+                preflight = run_preflight(validation, purpose)
+
         receipt.extracted_supplier_name = preflight.normalized_supplier_name or receipt.extracted_supplier_name
         receipt.extracted_supplier_tax_id = preflight.normalized_supplier_tax_id or receipt.extracted_supplier_tax_id
         receipt.extracted_supplier_iban = preflight.normalized_supplier_iban or receipt.extracted_supplier_iban
         receipt.extracted_supplier_bank_name = preflight.normalized_supplier_bank_name or receipt.extracted_supplier_bank_name
         receipt.validation_payload = {
-            **receipt.validation_payload,
+            **validation.model_dump(mode="json"),
+            **({"history_enrichment": history_enrichment} if history_enrichment else {}),
             "payment_purpose_final": preflight.normalized_purpose,
             "preflight_errors": preflight.errors,
             "payment_ready": preflight.ok,
@@ -211,7 +295,7 @@ class ReceiptPipeline:
             missing_fields=receipt.validation_payload.get("missing_fields") or [],
             raw_text=receipt.validation_payload.get("raw_text"),
         )
-        purpose = receipt.validation_payload.get("payment_purpose_final") or PaymentPurposeBuilder.build(validation)
+        purpose = receipt.validation_payload.get("payment_purpose_final") or PaymentPurposeBuilder.build_for_payment(validation)
         preflight = run_preflight(validation, purpose)
         if not preflight.ok:
             receipt.status = ReceiptStatus.requires_manual_review
@@ -434,17 +518,44 @@ class ReceiptPipeline:
             payload=crm_result.model_dump(mode="json"),
         )
 
+    def _repair_validation_iban_from_images(
+        self,
+        validation: ReceiptValidationResult,
+        image_paths: list[str],
+    ) -> ReceiptValidationResult:
+        if is_valid_iban(validation.supplier_iban):
+            return validation
+
+        candidates = []
+        for candidate in self.vision.extract_iban_candidates(image_paths):
+            normalized = normalize_iban(candidate)
+            if normalized and is_valid_iban(normalized) and normalized not in candidates:
+                candidates.append(normalized)
+        if len(candidates) != 1:
+            return validation
+        return validation.model_copy(update={"supplier_iban": candidates[0]})
+
     def _validate_saved_file(self, storage_path: Path, mime_type: str, original_filename: str) -> ReceiptValidationResult:
         extension = storage_path.suffix.lower()
         if mime_type.startswith("image/") or extension in {".jpg", ".jpeg", ".png", ".webp"}:
-            return self.vision.validate_receipt(str(storage_path))
+            validation = self.vision.validate_receipt(str(storage_path))
+            return self._repair_validation_iban_from_images(validation, [str(storage_path)])
 
         extracted_text = self.text_extractor.extract(str(storage_path)).strip()
         if not extracted_text:
+            if extension == ".pdf":
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    image_paths = self.text_extractor.render_pdf_pages(str(storage_path), tmpdir)
+                    if image_paths:
+                        image_path_strings = [str(path) for path in image_paths]
+                        validation = self.vision.validate_receipt_images(image_path_strings)
+                        return self._repair_validation_iban_from_images(validation, image_path_strings)
             return ReceiptValidationResult(
                 readable=False,
                 summary="Не вдалося витягти текст із документа.",
                 missing_fields=["document_text"],
                 raw_text="",
             )
-        return self.vision.validate_text_document(extracted_text[:50000], original_filename)
+        source_text = extracted_text[:50000]
+        validation = self.vision.validate_text_document(source_text, original_filename)
+        return validation.model_copy(update={"raw_text": source_text})

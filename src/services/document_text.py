@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import openpyxl
+import pypdfium2 as pdfium
 import xlrd
 from pypdf import PdfReader
 
@@ -29,6 +30,20 @@ class DocumentTextExtractor:
             if text:
                 chunks.append(f"[Page {index}]\n{text}")
         return "\n\n".join(chunks)
+
+    def render_pdf_pages(self, file_path: str, output_dir: str, max_pages: int = 3, scale: float = 3.0) -> list[Path]:
+        path = Path(file_path)
+        document = pdfium.PdfDocument(str(path))
+        image_paths: list[Path] = []
+        page_count = min(len(document), max_pages)
+        for index in range(page_count):
+            page = document[index]
+            bitmap = page.render(scale=scale)
+            image = bitmap.to_pil()
+            output_path = Path(output_dir) / f"{path.stem}-page-{index + 1}.png"
+            image.save(output_path, format="PNG")
+            image_paths.append(output_path)
+        return image_paths
 
     def _extract_xlsx(self, path: Path) -> str:
         workbook = openpyxl.load_workbook(path, data_only=True)

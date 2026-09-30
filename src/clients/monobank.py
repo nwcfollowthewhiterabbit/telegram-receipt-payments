@@ -32,8 +32,6 @@ class MonobankClient:
         if not value:
             return None
         digits = "".join(ch for ch in value if ch.isdigit())
-        if len(digits) > 10:
-            digits = digits[:8]
         if len(digits) in {8, 10}:
             return int(digits)
         return None

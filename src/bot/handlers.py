@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
 import logging
+from uuid import uuid4
 
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
@@ -15,10 +17,12 @@ from aiogram.types import (
 )
 
 from src.config import get_settings
+from src.connectors.communication.base import StoredIncomingFile
 from src.connectors.communication.registry import build_communication_adapter
 from src.db.models import ActionType, AuthorizedUser, Receipt, ReceiptStatus
 from src.db.session import SessionLocal
 from src.services.audit import write_audit_log
+from src.services.openai_errors import upload_failure_message
 from src.services.purpose_builder import PaymentPurposeBuilder
 from src.services.receipt_pipeline import ReceiptPipeline
 from src.services.schemas import ReceiptValidationResult
@@ -28,6 +32,7 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 pipeline = ReceiptPipeline()
 telegram_adapter = build_communication_adapter(settings)
+pending_duplicate_uploads: dict[str, StoredIncomingFile] = {}
 
 
 def _is_allowed(user_id: int) -> bool:
@@ -85,6 +90,26 @@ def _payment_choice_keyboard(receipt_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def _duplicate_receipt_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Повторно перевірити", callback_data=f"dup:create:{token}"),
+                InlineKeyboardButton(text="Скасувати", callback_data=f"dup:cancel:{token}"),
+            ]
+        ]
+    )
+
+
+def _format_receipt_datetime(value: dt.datetime | None) -> str:
+    if not value:
+        return "невідомо"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    kyiv_tz = dt.timezone(dt.timedelta(hours=3))
+    return value.astimezone(kyiv_tz).strftime("%d.%m.%Y %H:%M")
+
+
 def _is_ready_for_payment_choice(receipt: Receipt) -> bool:
     return receipt.status == ReceiptStatus.validated and bool((receipt.validation_payload or {}).get("payment_ready"))
 
@@ -121,7 +146,7 @@ def _render_receipt_result(receipt) -> str:
         missing_fields=receipt.validation_payload.get("missing_fields") or [],
         raw_text=receipt.validation_payload.get("raw_text"),
     )
-    built_purpose = PaymentPurposeBuilder.build(validation_view)
+    built_purpose = (receipt.validation_payload or {}).get("payment_purpose_final") or PaymentPurposeBuilder.build(validation_view)
     preflight_errors = receipt.validation_payload.get("preflight_errors") or []
     lines = [
         f"Результат розпізнавання [{_receipt_mode_label(receipt)}]:",
@@ -194,6 +219,31 @@ async def _answer_receipt_result(message: Message, receipt: Receipt) -> None:
     else:
         lines.append("Чернетку платежу створено без підпису. Далі її перевіряє та підписує людина.")
     await message.answer("\n".join(lines))
+
+
+async def _process_or_confirm_duplicate(message: Message, incoming_file: StoredIncomingFile) -> None:
+    with SessionLocal() as db:
+        existing = (
+            db.query(Receipt)
+            .filter(Receipt.telegram_file_id == incoming_file.telegram_file_id)
+            .order_by(Receipt.created_at.desc())
+            .first()
+        )
+        if existing:
+            token = uuid4().hex[:16]
+            pending_duplicate_uploads[token] = incoming_file
+            await message.answer(
+                "Цей файл уже завантажували.\n"
+                f"Дата і час попередньої обробки: {_format_receipt_datetime(existing.created_at)}\n"
+                f"Попередній рахунок: RCPT{existing.id:04d}\n\n"
+                "Запустити повторну перевірку цього файлу? Банківський платіж від цього не створюється.",
+                reply_markup=_duplicate_receipt_keyboard(token),
+            )
+            return
+
+        receipt = pipeline.process_incoming_file(db, incoming_file)
+
+    await _answer_receipt_result(message, receipt)
 
 
 def register_handlers(dp: Dispatcher) -> None:
@@ -280,17 +330,19 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
 
-        await message.answer("Фото отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
+        await message.answer("Фото отримано. Перевіряю файл.")
         try:
             incoming_file = await telegram_adapter.save_photo(message.bot, message)
-            with SessionLocal() as db:
-                receipt = pipeline.process_incoming_file(db, incoming_file)
-        except Exception:
+            await _process_or_confirm_duplicate(message, incoming_file)
+        except Exception as exc:
             logger.exception("Failed to process Telegram photo upload")
-            await message.answer("Не вдалося обробити фото. Спробуйте ще раз або надішліть рахунок як PDF/XLS/XLSX.")
+            await message.answer(
+                upload_failure_message(
+                    exc,
+                    "Не вдалося обробити фото. Спробуйте ще раз або надішліть рахунок як PDF/XLS/XLSX.",
+                )
+            )
             return
-
-        await _answer_receipt_result(message, receipt)
 
     @dp.message(F.document)
     async def handle_document(message: Message) -> None:
@@ -308,20 +360,76 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
 
-        await message.answer("Файл отримано. Розбираю рахунок на оплату та перевіряю реквізити.")
+        await message.answer("Файл отримано. Перевіряю файл.")
         try:
             incoming_file = await telegram_adapter.save_document(message.bot, message)
-            with SessionLocal() as db:
-                receipt = pipeline.process_incoming_file(db, incoming_file)
+            await _process_or_confirm_duplicate(message, incoming_file)
         except ValueError:
             await message.answer("Підтримуються лише фото, PDF, XLS і XLSX.")
             return
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to process Telegram document upload")
-            await message.answer("Не вдалося обробити файл. Спробуйте ще раз або надішліть інший PDF/XLS/XLSX.")
+            await message.answer(
+                upload_failure_message(
+                    exc,
+                    "Не вдалося обробити файл. Спробуйте ще раз або надішліть інший PDF/XLS/XLSX.",
+                )
+            )
             return
 
-        await _answer_receipt_result(message, receipt)
+    @dp.callback_query(F.data.startswith("dup:"))
+    async def handle_duplicate_choice(callback: CallbackQuery) -> None:
+        if not callback.from_user or not _is_allowed(callback.from_user.id):
+            await callback.answer("Доступ заборонено.", show_alert=True)
+            return
+
+        parts = (callback.data or "").split(":")
+        if len(parts) != 3:
+            await callback.answer("Некоректний вибір.", show_alert=True)
+            return
+        _, action, token = parts
+        incoming_file = pending_duplicate_uploads.get(token)
+        if not incoming_file:
+            await callback.answer("Запит на дубль уже неактивний. Надішліть файл ще раз.", show_alert=True)
+            if callback.message:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            return
+        if incoming_file.telegram_user_id != callback.from_user.id:
+            await callback.answer("Цей файл належить іншому користувачу.", show_alert=True)
+            return
+
+        if action == "cancel":
+            pending_duplicate_uploads.pop(token, None)
+            await callback.answer("Скасовано.")
+            if callback.message:
+                await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.message.answer("Повторну обробку скасовано.")
+            return
+        if action != "create":
+            await callback.answer("Некоректний вибір.", show_alert=True)
+            return
+
+        await callback.answer("Запускаю повторну перевірку...")
+        pending_duplicate_uploads.pop(token, None)
+        try:
+            with SessionLocal() as db:
+                receipt = pipeline.process_incoming_file(db, incoming_file)
+        except Exception as exc:
+            logger.exception("Failed to reprocess duplicate Telegram upload")
+            if callback.message:
+                await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.message.answer(
+                    upload_failure_message(
+                        exc,
+                        "Не вдалося повторно обробити файл. Надішліть рахунок ще раз пізніше.",
+                    )
+                )
+            return
+
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("Повторну перевірку завершено. Банківський платіж ще не створено.")
+            await _answer_receipt_result(callback.message, receipt)
 
     @dp.callback_query(F.data.startswith("pay:"))
     async def handle_payment_provider_choice(callback: CallbackQuery) -> None:

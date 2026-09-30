@@ -8,7 +8,15 @@ from typing import Any
 from openai import OpenAI
 
 from src.config import get_settings
-from src.services.payment_preflight import is_valid_iban, normalize_iban, normalize_text
+from src.services.payment_preflight import (
+    extract_company_tax_ids,
+    is_valid_iban,
+    normalize_iban,
+    normalize_tax_id,
+    normalize_text,
+    raw_text_contains_tax_id,
+    repair_iban_from_raw_text,
+)
 from src.services.purpose_builder import PaymentPurposeBuilder
 from src.services.schemas import PaymentDraftValidationResult, ReceiptValidationResult
 
@@ -64,14 +72,16 @@ class PaymentDraftValidationService:
         warnings: list[str] = []
         beneficiary_iban = normalize_iban(payment_payload.get("beneficiary_iban"))
         source_iban = normalize_iban(payment_payload.get("source_account"))
-        receipt_iban = normalize_iban(validation.supplier_iban)
+        receipt_iban = repair_iban_from_raw_text(validation.supplier_iban, validation.raw_text)
         amount = self._decimal(payment_payload.get("amount"))
         receipt_amount = self._decimal(validation.amount)
         currency = str(payment_payload.get("currency") or "").upper()
         receipt_currency = str(validation.currency or self.settings.default_currency).upper()
         purpose = normalize_text(str(payment_payload.get("purpose") or ""))
         beneficiary_name = normalize_text(str(payment_payload.get("beneficiary_name") or ""))
-        tax_id = "".join(ch for ch in str(payment_payload.get("beneficiary_tax_id") or "") if ch.isdigit())
+        tax_id = normalize_tax_id(str(payment_payload.get("beneficiary_tax_id") or ""))
+        receipt_tax_id = normalize_tax_id(validation.supplier_tax_id)
+        raw_text_tax_ids = extract_company_tax_ids(validation.raw_text)
 
         if not beneficiary_name:
             errors.append("missing_beneficiary_name")
@@ -93,14 +103,32 @@ class PaymentDraftValidationService:
             errors.append("payment_currency_mismatch")
         if provider == "monobank" and currency not in {"UAH", "ГРН", "980"}:
             errors.append("monobank_supports_only_uah")
-        if provider == "monobank" and len(tax_id) not in {8, 10}:
+        if not tax_id:
+            errors.append("missing_beneficiary_tax_id")
+        elif len(tax_id) not in {8, 10}:
+            errors.append("invalid_beneficiary_tax_id")
+        if receipt_tax_id and tax_id and receipt_tax_id != tax_id:
+            errors.append("beneficiary_tax_id_mismatch")
+        if raw_text_tax_ids and tax_id and tax_id not in raw_text_tax_ids and not raw_text_contains_tax_id(
+            validation.raw_text, tax_id
+        ):
+            errors.append("beneficiary_tax_id_mismatch_raw_text")
+        if provider == "monobank" and not tax_id:
             errors.append("monobank_requires_beneficiary_tax_id")
         if not purpose:
             errors.append("missing_payment_purpose")
         elif len(purpose) < 12:
             warnings.append("short_payment_purpose")
-        if re.search(r"\b20\d{2}-\d{2}-\d{2}\b", purpose or ""):
+        if re.search(r"\b20\d{2}-\d{2}-\d{2}\b", purpose or "") or re.search(
+            r"\b\d{1,2}\s+[А-ЯІЇЄҐа-яіїєґi]+\s+20\d{2}\b",
+            purpose or "",
+            re.IGNORECASE,
+        ):
             errors.append("payment_purpose_date_not_european_format")
+        if PaymentPurposeBuilder._has_forbidden_purpose_noise(purpose):
+            errors.append("payment_purpose_contains_table_noise")
+        if PaymentPurposeBuilder._looks_like_generic_supplier_buyer_subject(purpose):
+            errors.append("payment_purpose_too_generic")
 
         required_prefix = PaymentPurposeBuilder._extract_required_prefix(validation.raw_text)
         if required_prefix and not (purpose or "").startswith(required_prefix):

@@ -35,6 +35,8 @@ class ReceiptNotificationJob:
 
 
 class PaymentReceiptMonitor:
+    SUCCESS_STATUSES = {"success", "succeeded", "done", "processed", "completed", "sent"}
+
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
         self.settings = get_settings()
@@ -53,8 +55,6 @@ class PaymentReceiptMonitor:
             await asyncio.sleep(max(30, self.settings.privat24_receipt_poll_seconds))
 
     def _collect_jobs(self) -> list[ReceiptNotificationJob]:
-        if self.settings.payment_provider != "privat24":
-            return []
         if self.settings.privat24_dry_run or not self.settings.privat24_api_token:
             return []
 
@@ -62,6 +62,10 @@ class PaymentReceiptMonitor:
             pending_drafts = self._load_pending_drafts(db)
             if not pending_drafts:
                 return []
+
+            for draft in pending_drafts:
+                if self._should_sync_bank_state(draft):
+                    self._sync_bank_state(db, draft)
 
             transactions = self.privat24.get_transactions(
                 account=self.settings.privat24_source_account,
@@ -131,6 +135,32 @@ class PaymentReceiptMonitor:
             return delivery
         return {}
 
+    @staticmethod
+    def _bank_state(draft: PaymentDraft) -> dict[str, Any]:
+        payload = draft.provider_payload or {}
+        state = payload.get("final_bank_state")
+        if isinstance(state, dict):
+            return state
+        return {}
+
+    def _should_sync_bank_state(self, draft: PaymentDraft) -> bool:
+        state = self._bank_state(draft)
+        status = str(state.get("payment_status") or "").lower()
+        if status in self.SUCCESS_STATUSES:
+            return False
+
+        checked_at = state.get("checked_at")
+        if isinstance(checked_at, str):
+            try:
+                checked = dt.datetime.fromisoformat(checked_at)
+            except ValueError:
+                checked = None
+            if checked is not None:
+                age = dt.datetime.utcnow() - checked.replace(tzinfo=None)
+                if age.total_seconds() < max(30, self.settings.privat24_receipt_poll_seconds):
+                    return False
+        return True
+
     def _recipient_chat_ids(self, db: Session, draft: PaymentDraft) -> list[int]:
         chat_ids: list[int] = []
         receipt = draft.receipt
@@ -163,10 +193,72 @@ class PaymentReceiptMonitor:
         except InvalidOperation:
             return None
 
+    @classmethod
+    def _find_first(cls, value: Any, keys: set[str]) -> Any:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in keys and item not in (None, ""):
+                    return item
+            for item in value.values():
+                found = cls._find_first(item, keys)
+                if found not in (None, ""):
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = cls._find_first(item, keys)
+                if found not in (None, ""):
+                    return found
+        return None
+
+    def _sync_bank_state(self, db: Session, draft: PaymentDraft) -> None:
+        if not draft.provider_payment_id:
+            return
+        try:
+            bank_state = self.privat24.get_payment(draft.provider_payment_id)
+        except Exception as exc:
+            logger.warning("Failed to sync Privat24 payment state for draft %s: %s", draft.id, exc)
+            return
+
+        payment_status = self._find_first(
+            bank_state,
+            {"payment_status", "status", "state", "payment_state", "processing_status"},
+        )
+        payment_amount = self._find_first(bank_state, {"payment_amount", "amount", "sum"})
+        payment_destination = self._find_first(bank_state, {"payment_destination", "destination", "purpose", "osnd"})
+        provider_ref = self._find_first(bank_state, {"payment_ref", "ref"}) or draft.provider_payment_id
+        provider_pack_ref = self._find_first(bank_state, {"payment_pack_ref", "pack_ref"}) or draft.provider_pack_id
+
+        payload = dict(draft.provider_payload or {})
+        payload["final_bank_state"] = {
+            "checked_at": dt.datetime.utcnow().isoformat(),
+            "payment_ref": str(provider_ref) if provider_ref is not None else None,
+            "payment_pack_ref": str(provider_pack_ref) if provider_pack_ref is not None else None,
+            "payment_status": str(payment_status).lower() if payment_status is not None else None,
+            "payment_amount": str(payment_amount) if payment_amount is not None else None,
+            "payment_destination": str(payment_destination) if payment_destination is not None else None,
+            "purpose_changed": bool(
+                payment_destination
+                and self._normalize_text(str(payment_destination)) != self._normalize_text(draft.purpose)
+            ),
+            "amount_changed": bool(
+                payment_amount is not None
+                and self._normalize_amount(payment_amount) is not None
+                and self._normalize_amount(draft.amount) != self._normalize_amount(payment_amount)
+            ),
+            "raw": bank_state,
+        }
+        draft.provider_payload = payload
+
+        normalized_status = str(payment_status or "").lower()
+        if normalized_status in self.SUCCESS_STATUSES and draft.status not in {"receipt_sent", "receipt_delivery_pending"}:
+            draft.status = "bank_success"
+        db.add(draft)
+        db.commit()
+        db.refresh(draft)
+
     def _match_transaction(self, draft: PaymentDraft, transactions: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
         target_amount = self._normalize_amount(draft.amount)
         target_iban = self._normalize_text(draft.beneficiary_iban)
-        target_purpose = self._normalize_text(draft.purpose)
         target_name = self._normalize_text(draft.beneficiary_name)
 
         for item in transactions:
@@ -179,9 +271,6 @@ class PaymentReceiptMonitor:
                 continue
             amount = self._normalize_amount(item.get("SUM"))
             if target_amount is not None and amount != target_amount:
-                continue
-            purpose = self._normalize_text(item.get("OSND"))
-            if target_purpose and purpose and target_purpose not in purpose:
                 continue
             name = self._normalize_text(item.get("AUT_CNTR_NAM"))
             if target_name and name and target_name not in name and name not in target_name:
