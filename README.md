@@ -1,5 +1,11 @@
 # Receipt Pay Bot
 
+Актуальные документы:
+[проверка поставщика](docs/supplier-identity-safety.md),
+[инструкция пользователю (uk)](docs/user-manual.uk.md),
+[карта полей и приёмка бухгалтером](docs/crm-accountant-review.md),
+[история изменений](CHANGELOG.md).
+
 Docker-проект для Telegram-бота, который:
 
 - принимает от сотрудников фото счетов на оплату;

@@ -1,0 +1,279 @@
+{
+  "$id": "rabbit-capability-observation/1.0.0",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "1.0.0"
+    },
+    "dependencies": {
+      "additionalProperties": false,
+      "properties": {
+        "apps": {
+          "$ref": "#/$defs/textList"
+        },
+        "doctypes": {
+          "$ref": "#/$defs/textList"
+        },
+        "erpnext_versions": {
+          "$ref": "#/$defs/textList"
+        },
+        "external_services": {
+          "$ref": "#/$defs/textList"
+        },
+        "frappe_versions": {
+          "$ref": "#/$defs/textList"
+        }
+      },
+      "required": [
+        "frappe_versions",
+        "erpnext_versions",
+        "apps",
+        "doctypes",
+        "external_services"
+      ],
+      "type": "object"
+    },
+    "differences": {
+      "$ref": "#/$defs/textList"
+    },
+    "event": {
+      "enum": [
+        "discovered",
+        "implemented",
+        "reused",
+        "varied",
+        "retired"
+      ]
+    },
+    "evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "adr_paths": {
+          "$ref": "#/$defs/pathList"
+        },
+        "repository_paths": {
+          "$ref": "#/$defs/pathList"
+        },
+        "test_paths": {
+          "$ref": "#/$defs/pathList"
+        }
+      },
+      "required": [
+        "repository_paths",
+        "test_paths",
+        "adr_paths"
+      ],
+      "type": "object"
+    },
+    "feature": {
+      "additionalProperties": false,
+      "properties": {
+        "business_problem": {
+          "$ref": "#/$defs/shortText"
+        },
+        "category": {
+          "enum": [
+            "ui-ux-improvement",
+            "generic-erp-improvement",
+            "integration",
+            "workflow",
+            "warehouse",
+            "crm",
+            "logistics",
+            "3pl",
+            "rental",
+            "localization",
+            "reporting",
+            "permissions",
+            "infrastructure",
+            "other"
+          ]
+        },
+        "description": {
+          "$ref": "#/$defs/shortText"
+        },
+        "local_id": {
+          "pattern": "^[a-z0-9][a-z0-9-]{2,95}$",
+          "type": "string"
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        }
+      },
+      "required": [
+        "local_id",
+        "name",
+        "description",
+        "business_problem",
+        "category"
+      ],
+      "type": "object"
+    },
+    "implementation": {
+      "additionalProperties": false,
+      "properties": {
+        "apps": {
+          "$ref": "#/$defs/textList"
+        },
+        "doctypes": {
+          "$ref": "#/$defs/textList"
+        },
+        "kind": {
+          "enum": [
+            "original",
+            "copied",
+            "adapted",
+            "shared-component",
+            "configuration-only",
+            "retired"
+          ]
+        },
+        "modules": {
+          "$ref": "#/$defs/textList"
+        },
+        "repository_paths": {
+          "$ref": "#/$defs/nonEmptyPathList"
+        }
+      },
+      "required": [
+        "kind",
+        "apps",
+        "modules",
+        "repository_paths",
+        "doctypes"
+      ],
+      "type": "object"
+    },
+    "observation_id": {
+      "pattern": "^OBS-[a-z0-9][a-z0-9-]{2,95}$",
+      "type": "string"
+    },
+    "observed_at": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "type": "string"
+    },
+    "privacy_review": {
+      "additionalProperties": false,
+      "properties": {
+        "contains_personal_data": {
+          "const": false
+        },
+        "contains_raw_feedback": {
+          "const": false
+        },
+        "contains_runtime_urls": {
+          "const": false
+        },
+        "contains_secrets": {
+          "const": false
+        },
+        "reviewed": {
+          "const": true
+        }
+      },
+      "required": [
+        "reviewed",
+        "contains_raw_feedback",
+        "contains_personal_data",
+        "contains_secrets",
+        "contains_runtime_urls"
+      ],
+      "type": "object"
+    },
+    "project_key": {
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+      "type": "string"
+    },
+    "relationships": {
+      "additionalProperties": false,
+      "properties": {
+        "capability_ids": {
+          "items": {
+            "pattern": "^CAP-[A-Z0-9]+-[0-9]{4}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "observation_ids": {
+          "items": {
+            "pattern": "^OBS-[a-z0-9][a-z0-9-]{2,95}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "capability_ids",
+        "observation_ids"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "source_revision": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "contract_version",
+    "observation_id",
+    "event",
+    "observed_at",
+    "project_key",
+    "source_revision",
+    "feature",
+    "implementation",
+    "dependencies",
+    "relationships",
+    "differences",
+    "evidence",
+    "privacy_review"
+  ],
+  "type": "object",
+  "$defs": {
+    "name": {
+      "maxLength": 120,
+      "minLength": 1,
+      "type": "string"
+    },
+    "nonEmptyPathList": {
+      "items": {
+        "$ref": "#/$defs/repositoryPath"
+      },
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "pathList": {
+      "items": {
+        "$ref": "#/$defs/repositoryPath"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "repositoryPath": {
+      "maxLength": 300,
+      "minLength": 1,
+      "type": "string"
+    },
+    "shortText": {
+      "maxLength": 500,
+      "minLength": 1,
+      "type": "string"
+    },
+    "textList": {
+      "items": {
+        "maxLength": 200,
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    }
+  }
+}

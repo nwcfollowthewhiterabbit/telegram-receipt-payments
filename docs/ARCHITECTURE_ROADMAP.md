@@ -40,12 +40,14 @@ Runtime selection is controlled by environment variables:
 - `CRM_DRY_RUN=true|false`
 - `COMMUNICATION_PROVIDER=telegram`
 
-Current production-like configuration on the server:
+Runtime observations verified read-only on 2026-10-16:
 
-- Default payment provider: `monobank`
-- Payment mode: provider-specific live/dry-run, selected per invoice in Telegram
+- Both bank connectors operate in LIVE mode; the user selects a bank per invoice in Telegram.
 - CRM provider: `terrasoft_mssql`
-- CRM mode: dry-run
+- CRM mode: live writes into the test database. The actual connected database, checked with `SELECT DB_NAME()`, is `Terrasoft_test`.
+- Test CRM does not make bank drafts test-only. Bank drafts remain unsigned until a human signs them.
+
+The previous CRM dry-run description was a historical deployment snapshot. See the current [accountant review](crm-accountant-review.md) for field mapping, known limitations, and acceptance questions. Lookup labels and the exact bank source-account selection still need verification; do not infer them from code constant names.
 
 ## Architectural Rules
 
@@ -79,7 +81,7 @@ Current production-like configuration on the server:
 
 ## Known Gaps
 
-- `MONOBANK_SOURCE_IBAN` is not configured yet. Monobank returned multiple UAH accounts, so the connector intentionally refuses automatic account selection.
+- A historical setup issue was an unset `MONOBANK_SOURCE_IBAN` with multiple UAH accounts. Its current setting and intended source account were not verified in this review. The connector still refuses automatic selection when the setting is empty and the bank returns multiple UAH accounts.
 - Terrasoft test mapping targets `Terrasoft_test.dbo.tbl_Cashflow`.
 - Production Terrasoft writes are intentionally blocked in code. The live connector currently allows only `Terrasoft_test`.
 - There is only one communication adapter today: Telegram.
@@ -169,7 +171,7 @@ Phase 4: Operational Hardening
 
 ## Immediate Next Steps
 
-1. Set `MONOBANK_SOURCE_IBAN` explicitly.
+1. Verify the currently configured `MONOBANK_SOURCE_IBAN` and confirm the intended source account with accounting; do not treat the historical missing-setting note as current runtime evidence.
 2. Provide Terrasoft table/column schema or read-only DB access for schema inspection.
 3. Decide whether Terrasoft direct MS SQL writes are acceptable.
 4. Initialize or connect the project to a GitHub repository.

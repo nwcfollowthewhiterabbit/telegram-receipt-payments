@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TELEGRAM_BOT_TOKEN: test-no-network
+      OPENAI_API_KEY: ""
+      PAYMENT_DRY_RUN: "true"
+      CRM_DRY_RUN: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+      - name: Architecture contract
+        run: python -m scripts.check_architecture
+      - name: Capability observations
+        run: python scripts/validate_capability_observations.py
+
+  package-build:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build exact source image
+        run: |
+          docker build --label org.opencontainers.image.revision=${{ github.sha }} -t receipt-paybot:${{ github.sha }} .
+          docker save receipt-paybot:${{ github.sha }} | gzip > receipt-paybot-image.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: receipt-paybot-image
+          path: receipt-paybot-image.tar.gz
+          retention-days: 7
+
+  foundation-instance:
+    needs: package-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: receipt-paybot-image
+      - name: Isolated image regression and import checks
+        run: |
+          docker load < receipt-paybot-image.tar.gz
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,size=96m \
+            -e TELEGRAM_BOT_TOKEN=test-no-network -e OPENAI_API_KEY= \
+            -e PAYMENT_DRY_RUN=true -e CRM_DRY_RUN=true \
+            -v "$PWD/tests:/app/tests:ro" receipt-paybot:${{ github.sha }} \
+            sh -c 'python -m unittest discover -s tests -p "test_*.py" && python -m scripts.check_architecture'

@@ -18,6 +18,7 @@ from .payment_preflight import is_valid_iban, normalize_iban, normalize_tax_id, 
 from .purpose_builder import PaymentPurposeBuilder
 from .schemas import PaymentDraftValidationResult, ReceiptValidationResult
 from .vision import ReceiptVisionService
+from .supplier_identity import supplier_identity_errors
 
 
 class ReceiptPipeline:
@@ -61,6 +62,9 @@ class ReceiptPipeline:
         validation: ReceiptValidationResult,
         preflight_errors: list[str],
     ) -> tuple[ReceiptValidationResult, dict]:
+        if supplier_identity_errors(validation.supplier_name, validation.supplier_tax_id,
+                                    validation.supplier_iban, validation.raw_text):
+            return validation, {}
         if not {"missing_supplier_tax_id", "invalid_supplier_iban", "missing_supplier_iban"}.intersection(
             preflight_errors
         ):
@@ -277,6 +281,14 @@ class ReceiptPipeline:
             return receipt
         if not (receipt.validation_payload or {}).get("payment_ready"):
             raise ValueError("receipt_is_not_ready_for_payment")
+
+        # Re-read the saved original, including legacy pending receipts. An old
+        # payment_ready flag or a model-written raw_text is not source evidence.
+        try:
+            source_text = self._read_payment_source(receipt)
+        except Exception:
+            source_text = ""
+        receipt.validation_payload = {**(receipt.validation_payload or {}), "raw_text": source_text}
 
         validation = ReceiptValidationResult(
             readable=True,
@@ -559,3 +571,14 @@ class ReceiptPipeline:
         source_text = extracted_text[:50000]
         validation = self.vision.validate_text_document(source_text, original_filename)
         return validation.model_copy(update={"raw_text": source_text})
+
+    def _read_payment_source(self, receipt: Receipt) -> str:
+        path = Path(receipt.storage_path)
+        if receipt.mime_type.startswith("image/") or path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+            return self.vision.transcribe_receipt_images([str(path)])
+        source_text = self.text_extractor.extract(str(path)).strip()
+        if not source_text and path.suffix.lower() == ".pdf":
+            with tempfile.TemporaryDirectory() as tmpdir:
+                paths = self.text_extractor.render_pdf_pages(str(path), tmpdir)
+                return self.vision.transcribe_receipt_images([str(p) for p in paths])
+        return source_text

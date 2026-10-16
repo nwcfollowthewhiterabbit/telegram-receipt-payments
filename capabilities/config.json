@@ -1,0 +1,11 @@
+{
+  "contract_version": "1.0.0",
+  "deployment_gate": false,
+  "observation_schema_sha256": "37566933921e12c053a9f5096139b4df788151f0dc09b923853146a165258fa3",
+  "outbox_path": "capabilities/outbox",
+  "project_aliases": [],
+  "project_key": "nwcfollowthewhiterabbit/telegram-receipt-payments",
+  "publication_mode": "central-reviewed-import",
+  "registry_repository": "nwcfollowthewhiterabbit/rabbit-erp-customization-registry",
+  "schema_version": 1
+}

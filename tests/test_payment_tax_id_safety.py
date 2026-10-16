@@ -20,13 +20,16 @@ from src.services.schemas import ReceiptValidationResult
 VALID_IBAN = "UA413220010000026002350010497"
 
 
-def receipt(tax_id: str | None, raw_text: str | None) -> ReceiptValidationResult:
+def receipt(tax_id: str | None, raw_text: str | None, *, name: str = "Фізична особа-підприємець Момот Марина Сергіївна", iban: str = VALID_IBAN) -> ReceiptValidationResult:
+    # Identifier-focused tests also need explicit evidence of the supplier role.
+    if raw_text and "Постачальник" not in raw_text:
+        raw_text = f"Постачальник: {name}\n{raw_text}\nIBAN: {iban}"
     return ReceiptValidationResult(
         readable=True,
         summary="ok",
-        supplier_name="Фізична особа-підприємець Момот Марина Сергіївна",
+        supplier_name=name,
         supplier_tax_id=tax_id,
-        supplier_iban=VALID_IBAN,
+        supplier_iban=iban,
         supplier_bank_name='АТ "УНІВЕРСАЛ БАНК"',
         amount=Decimal("18980.00"),
         currency="UAH",
@@ -86,7 +89,7 @@ class PaymentTaxIdSafetyTest(unittest.TestCase):
             'Одержувач ТОВ "РЕНТОЛЛ СЕРВІС" ЄДРПОУ 43105412'
         )
         result = run_preflight(
-            receipt("45790487", raw_text),
+            receipt("45790487", raw_text, name='ТОВ "ГЕКСТЕК"', iban="UA773220010000026007700005176"),
             "Оплата за електронні компоненти згідно рахунку №632458 від 25.06.2026. у т.ч. ПДВ 380,00 грн.",
         )
 
@@ -97,7 +100,7 @@ class PaymentTaxIdSafetyTest(unittest.TestCase):
         raw_text = (
             'Платник ТОВ "РЕНТОЛЛ СЕРВIС"\n'
             "UA70 305299 00000 26000046803093\n"
-            'Товариство з обмеженою відповідальністю "Авер-ТЕХ"\n'
+            'Постачальник: Товариство з обмеженою відповідальністю "Авер-ТЕХ"\n'
             "21665318\n"
             "UA39 334851 00000 00002600710364"
         )
@@ -196,7 +199,7 @@ class PaymentTaxIdSafetyTest(unittest.TestCase):
             'Одержувач ТОВ "РЕНТОЛЛ СЕРВІС" ЄДРПОУ 43105412'
         )
         result = service._validate_deterministic(
-            receipt("45790487", raw_text),
+            receipt("45790487", raw_text, name='ТОВ "ГЕКСТЕК"'),
             {
                 "source_account": "UA703052990000026000046803093",
                 "beneficiary_name": 'ТОВ "ГЕКСТЕК"',

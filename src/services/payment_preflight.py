@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 
 from src.services.schemas import ReceiptValidationResult
+from src.services.supplier_identity import supplier_identity_errors, supplier_source_text
 
 UKRAINIAN_IBAN_LENGTH = 29
 UKRAINIAN_IBAN_ACCOUNT_PREFIX = "000002600"
@@ -185,17 +186,19 @@ class PreflightResult:
 
 
 def run_preflight(validation: ReceiptValidationResult, purpose: str) -> PreflightResult:
+    # Fallbacks may only use the supplier's block, never the buyer's requisites.
+    supplier_text = supplier_source_text(validation.raw_text) or ""
     supplier_name = normalize_text(validation.supplier_name)
     supplier_tax_id = normalize_tax_id(validation.supplier_tax_id)
     raw_supplier_tax_id = digits_only(validation.supplier_tax_id)
-    supplier_iban = repair_iban_from_raw_text(validation.supplier_iban, validation.raw_text)
+    supplier_iban = repair_iban_from_raw_text(validation.supplier_iban, supplier_text)
     supplier_bank_name = normalize_text(validation.supplier_bank_name)
     normalized_purpose = normalize_text(purpose)
-    company_tax_ids = extract_company_tax_ids(validation.raw_text)
+    company_tax_ids = extract_company_tax_ids(supplier_text)
 
     tax_id_conflicts_raw_text = False
     if company_tax_ids:
-        if supplier_tax_id and raw_text_contains_tax_id(validation.raw_text, supplier_tax_id):
+        if supplier_tax_id and raw_text_contains_tax_id(supplier_text, supplier_tax_id):
             pass
         elif supplier_tax_id and supplier_tax_id not in company_tax_ids:
             company_tax_ids_by_length = sorted(company_tax_ids, key=len, reverse=True)
@@ -206,7 +209,7 @@ def run_preflight(validation: ReceiptValidationResult, purpose: str) -> Prefligh
                 supplier_tax_id = None
         elif not supplier_tax_id:
             supplier_tax_id = company_tax_ids[0]
-    elif supplier_tax_id and validation.raw_text and not raw_text_contains_tax_id(validation.raw_text, supplier_tax_id):
+    elif supplier_tax_id and supplier_text and not raw_text_contains_tax_id(supplier_text, supplier_tax_id):
         tax_id_conflicts_raw_text = True
         supplier_tax_id = None
 
@@ -222,7 +225,7 @@ def run_preflight(validation: ReceiptValidationResult, purpose: str) -> Prefligh
         supplier_tax_id = company_tax_ids[0]
         tax_id_conflicts_raw_text = False
 
-    errors: list[str] = []
+    errors = supplier_identity_errors(supplier_name, supplier_tax_id, supplier_iban, validation.raw_text)
 
     if not supplier_name:
         errors.append("missing_supplier_name")

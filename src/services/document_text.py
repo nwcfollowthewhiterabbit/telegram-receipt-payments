@@ -26,16 +26,20 @@ class DocumentTextExtractor:
         reader = PdfReader(str(path))
         chunks: list[str] = []
         for index, page in enumerate(reader.pages, start=1):
-            text = (page.extract_text() or "").strip()
+            # PDF drawing order can put a customer's name beside a supplier's
+            # requisites. Preserve visual rows before interpreting party roles.
+            text = (page.extract_text(extraction_mode="layout") or "").strip()
             if text:
                 chunks.append(f"[Page {index}]\n{text}")
         return "\n\n".join(chunks)
 
-    def render_pdf_pages(self, file_path: str, output_dir: str, max_pages: int = 3, scale: float = 3.0) -> list[Path]:
+    def render_pdf_pages(self, file_path: str, output_dir: str, max_pages: int = 10, scale: float = 3.0) -> list[Path]:
         path = Path(file_path)
         document = pdfium.PdfDocument(str(path))
         image_paths: list[Path] = []
-        page_count = min(len(document), max_pages)
+        if len(document) > max_pages:
+            raise ValueError("source_document_too_many_pages")
+        page_count = len(document)
         for index in range(page_count):
             page = document[index]
             bitmap = page.render(scale=scale)

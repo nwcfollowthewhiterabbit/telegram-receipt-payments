@@ -167,6 +167,10 @@ def _render_receipt_result(receipt) -> str:
         lines.append(f"Відсутнє або нечитабельне: {', '.join(missing_fields)}")
     if preflight_errors:
         lines.append(f"Помилки preflight: {', '.join(preflight_errors)}")
+        if any(error.startswith("supplier_") for error in preflight_errors):
+            lines.append("Не підтверджено єдиного постачальника: назва, код та IBAN мають належати "
+                         "постачальнику/виконавцю, а не одержувачу товарів або послуг. "
+                         "Перевірте оригінал рахунку; платіж заблоковано до уточнення реквізитів.")
     payment_create_error = receipt.validation_payload.get("payment_create_error")
     if payment_create_error:
         lines.append(f"Помилка створення платежу: {payment_create_error}")
