@@ -4,7 +4,8 @@
 [проверка поставщика](docs/supplier-identity-safety.md),
 [инструкция пользователю (uk)](docs/user-manual.uk.md),
 [карта полей и приёмка бухгалтером](docs/crm-accountant-review.md),
-[история изменений](CHANGELOG.md).
+[история изменений](CHANGELOG.md),
+[установленный релиз и backup/rollback](docs/releases/2026-10-16-supplier-identity.md).
 
 Docker-проект для Telegram-бота, который:
 
