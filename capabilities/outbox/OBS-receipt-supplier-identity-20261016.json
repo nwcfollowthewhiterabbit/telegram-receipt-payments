@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "contract_version": "1.0.0",
+  "observation_id": "OBS-receipt-supplier-identity-20261016",
+  "observed_at": "2026-10-16T06:10:00Z",
+  "project_key": "nwcfollowthewhiterabbit/telegram-receipt-payments",
+  "source_revision": "d8cbb9c22910a4a32431eb7f7b372983f8d8df51",
+  "event": "implemented",
+  "feature": {
+    "local_id": "source-grounded-supplier-identity",
+    "name": "Supplier identity validation before payment preparation",
+    "description": "Requires the beneficiary name, registration code and account to belong to one explicitly identified supplier block before preparing a payment draft.",
+    "business_problem": "An invoice may name both a supplier and a recipient of services, allowing independent field extraction to combine different parties.",
+    "category": "integration"
+  },
+  "implementation": {
+    "kind": "original",
+    "apps": ["receipt-paybot"],
+    "modules": ["src.services.supplier_identity", "src.services.payment_preflight", "src.services.payment_draft_validation", "src.services.receipt_pipeline"],
+    "repository_paths": ["src/services/supplier_identity.py", "src/services/payment_preflight.py", "src/services/payment_draft_validation.py", "src/services/receipt_pipeline.py", "src/services/document_text.py", "src/services/vision.py"],
+    "doctypes": []
+  },
+  "dependencies": {
+    "apps": [],
+    "doctypes": [],
+    "frappe_versions": [],
+    "erpnext_versions": [],
+    "external_services": ["OpenAI"]
+  },
+  "relationships": {"capability_ids": [], "observation_ids": []},
+  "differences": [],
+  "evidence": {
+    "repository_paths": ["docs/supplier-identity-safety.md", "docs/10-agent-handoffs/records/2026/2026-10-16-supplier-role-fix.md"],
+    "test_paths": ["tests/test_supplier_identity.py", "tests/test_supplier_pipeline_safety.py", "tests/test_payment_tax_id_safety.py"],
+    "adr_paths": []
+  },
+  "privacy_review": {
+    "reviewed": true,
+    "contains_raw_feedback": false,
+    "contains_personal_data": false,
+    "contains_secrets": false,
+    "contains_runtime_urls": false
+  }
+}
