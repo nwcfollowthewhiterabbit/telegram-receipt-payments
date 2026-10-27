@@ -6,7 +6,7 @@
 [карта полей и приёмка бухгалтером](docs/crm-accountant-review.md),
 [переключение CRM на рабочую базу](docs/crm-production-cutover.md),
 [история изменений](CHANGELOG.md),
-[установленный релиз и backup/rollback](docs/releases/2026-10-16-supplier-identity.md).
+[текущий релиз CRM и backup/rollback](docs/releases/2026-10-27-crm-production.md).
 
 Docker-проект для Telegram-бота, который:
 

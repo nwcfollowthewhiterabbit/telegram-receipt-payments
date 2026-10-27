@@ -40,14 +40,14 @@ Runtime selection is controlled by environment variables:
 - `CRM_DRY_RUN=true|false`
 - `COMMUNICATION_PROVIDER=telegram`
 
-Runtime observations verified read-only on 2026-10-16:
+Runtime observations verified on 2026-10-27 after the accepted production cutover:
 
 - Both bank connectors operate in LIVE mode; the user selects a bank per invoice in Telegram.
 - CRM provider: `terrasoft_mssql`
-- CRM mode: live writes into the test database. The actual connected database, checked with `SELECT DB_NAME()`, is `Terrasoft_test`.
-- Test CRM does not make bank drafts test-only. Bank drafts remain unsigned until a human signs them.
+- CRM mode: live writes into production. The actual connected database, checked with `SELECT DB_NAME()`, is `Terrasoft`. Test operations remain in `Terrasoft_test` and were not migrated.
+- Bank drafts remain unsigned until a human signs them. The cutover SQL test used explicit rollback and did not create a bank draft.
 
-The previous CRM dry-run description was a historical deployment snapshot. See the current [accountant review](crm-accountant-review.md) for field mapping, known limitations, and acceptance questions. Lookup labels and the exact bank source-account selection still need verification; do not infer them from code constant names.
+See the [production release evidence](releases/2026-10-27-crm-production.md) and [accountant review](crm-accountant-review.md) for accepted field mapping and retained limitations. Seven fixed lookup records match the accepted test database; bank account selection was not changed by the cutover.
 
 ## Architectural Rules
 
