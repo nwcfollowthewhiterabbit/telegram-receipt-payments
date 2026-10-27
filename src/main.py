@@ -8,6 +8,7 @@ from aiogram import Bot, Dispatcher
 
 from src.bot.handlers import register_handlers
 from src.config import get_settings
+from src.connectors.crm.registry import build_crm_connector
 from src.connectors.payments.privat24_receipt_monitor import PaymentReceiptMonitor
 from src.db.session import init_db
 
@@ -17,6 +18,8 @@ logging.basicConfig(level=logging.INFO)
 
 async def main() -> None:
     settings = get_settings()
+    if settings.crm_provider == "terrasoft_mssql" and not settings.crm_dry_run:
+        build_crm_connector(settings).verify_connection_target()
     init_db()
     bot = Bot(token=settings.telegram_bot_token)
     dp = Dispatcher()

@@ -82,8 +82,8 @@ The previous CRM dry-run description was a historical deployment snapshot. See t
 ## Known Gaps
 
 - A historical setup issue was an unset `MONOBANK_SOURCE_IBAN` with multiple UAH accounts. Its current setting and intended source account were not verified in this review. The connector still refuses automatic selection when the setting is empty and the bank returns multiple UAH accounts.
-- Terrasoft test mapping targets `Terrasoft_test.dbo.tbl_Cashflow`.
-- Production Terrasoft writes are intentionally blocked in code. The live connector currently allows only `Terrasoft_test`.
+- The cashflow mapping is unchanged between test and production. On 2026-10-27 the user reported customer acceptance of the test integration and authorized production on the same SQL server.
+- Live CRM requires the declared database, URL database and actual `DB_NAME()` to match exactly: `Terrasoft_test` or `Terrasoft`. The startup check precedes polling and bank monitoring; every write transaction repeats the check. See [cutover contract](crm-production-cutover.md); release evidence determines the deployed target.
 - There is only one communication adapter today: Telegram.
 
 ## Terrasoft/XRM v3 Integration Plan

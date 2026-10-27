@@ -7,6 +7,8 @@ import calendar
 from uuid import uuid4
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import ArgumentError
 
 from src.config import get_settings
 from src.db.models import PaymentDraft, Receipt, ReceiptStatus
@@ -14,6 +16,7 @@ from src.services.schemas import CrmSyncResult
 
 
 TERRASOFT_TEST_DATABASE = "Terrasoft_test"
+TERRASOFT_ALLOWED_DATABASES = frozenset({TERRASOFT_TEST_DATABASE, "Terrasoft"})
 TERRASOFT_CASHFLOW_TABLE = "dbo.tbl_Cashflow"
 
 CASHFLOW_TYPE_EXPENSE_ID = "484C8429-DABF-482A-BC7B-4C75D1436A1B"
@@ -41,15 +44,19 @@ class TerrasoftMssqlConnector:
                 payload=payload,
             )
 
-        self._validate_live_target()
-        engine = create_engine(self.settings.terrasoft_mssql_url, future=True, pool_pre_ping=True)
-        with engine.begin() as connection:
-            recipient = self._find_account_by_supplier_code(connection, receipt.extracted_supplier_tax_id)
-            payload["recipient_id"] = recipient["id"] if recipient else None
-            payload["recipient_match"] = recipient
-            payload["cf_number"] = self._next_cf_number(connection)
-            payload["period_id"] = self._ensure_period_id(connection, payload["estimated_date"])
-            connection.execute(*self._build_cashflow_insert(payload))
+        target_url = self._validate_live_target()
+        engine = create_engine(target_url, future=True, pool_pre_ping=True)
+        try:
+            with engine.begin() as connection:
+                self._verify_connection_database(connection)
+                recipient = self._find_account_by_supplier_code(connection, receipt.extracted_supplier_tax_id)
+                payload["recipient_id"] = recipient["id"] if recipient else None
+                payload["recipient_match"] = recipient
+                payload["cf_number"] = self._next_cf_number(connection)
+                payload["period_id"] = self._ensure_period_id(connection, payload["estimated_date"])
+                connection.execute(*self._build_cashflow_insert(payload))
+        finally:
+            engine.dispose()
 
         return CrmSyncResult(
             synced=True,
@@ -68,14 +75,57 @@ class TerrasoftMssqlConnector:
             },
         )
 
-    def _validate_live_target(self) -> None:
+    def verify_connection_target(self) -> str | None:
+        """Verify the live CRM target read-only before enabling bot activity.
+
+        Dry-run does not initialize an engine or connect to the external CRM.
+        The same check also runs on the transaction used by every live sync.
+        """
+        if self.settings.crm_dry_run:
+            return None
+        target_url = self._validate_live_target()
+        engine = create_engine(target_url, future=True, pool_pre_ping=True)
+        try:
+            try:
+                with engine.connect() as connection:
+                    return self._verify_connection_database(connection)
+            except Exception:
+                # Driver exceptions may contain connection details. Startup
+                # must fail without logging the URL or credentials.
+                raise RuntimeError("Terrasoft CRM target verification failed") from None
+        finally:
+            engine.dispose()
+
+    def _validate_live_target(self) -> URL:
         if not self.settings.terrasoft_mssql_url:
             raise RuntimeError("TERRASOFT_MSSQL_URL is required for Terrasoft CRM sync")
-        if self.settings.terrasoft_database != TERRASOFT_TEST_DATABASE:
-            raise RuntimeError("Terrasoft live sync is currently allowed only for Terrasoft_test")
+        if self.settings.terrasoft_database not in TERRASOFT_ALLOWED_DATABASES:
+            raise RuntimeError("TERRASOFT_DATABASE must be Terrasoft_test or Terrasoft")
+        try:
+            target_url = make_url(self.settings.terrasoft_mssql_url)
+        except (ArgumentError, TypeError, ValueError):
+            raise RuntimeError("Invalid TERRASOFT_MSSQL_URL") from None
+        if target_url.drivername != "mssql+pymssql" or not target_url.host:
+            raise RuntimeError("Terrasoft CRM requires a direct mssql+pymssql URL")
+        # A query parameter could override the path database or hide another
+        # connection string. The deployed connector does not require queries.
+        if target_url.query:
+            raise RuntimeError("TERRASOFT_MSSQL_URL query overrides are not allowed")
+        if not target_url.database or target_url.database != self.settings.terrasoft_database:
+            raise RuntimeError("TERRASOFT_MSSQL_URL database must match TERRASOFT_DATABASE")
         table = self.settings.terrasoft_invoice_table or TERRASOFT_CASHFLOW_TABLE
         if table != TERRASOFT_CASHFLOW_TABLE:
             raise RuntimeError("Terrasoft cashflow sync requires TERRASOFT_INVOICE_TABLE=dbo.tbl_Cashflow")
+        return target_url
+
+    def _verify_connection_database(self, connection) -> str:
+        try:
+            actual_database = connection.execute(text("SELECT DB_NAME()")).scalar_one()
+        except Exception:
+            raise RuntimeError("Terrasoft CRM connected database could not be verified") from None
+        if actual_database != self.settings.terrasoft_database:
+            raise RuntimeError("Terrasoft CRM connected database does not match the configured target")
+        return actual_database
 
     def _build_payload(self, receipt: Receipt, payment_draft: PaymentDraft | None) -> dict:
         now = dt.datetime.utcnow()
