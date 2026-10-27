@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "contract_version": "1.0.0",
+  "observation_id": "OBS-receipt-crm-target-guard-20261027",
+  "observed_at": "2026-10-27T08:30:00Z",
+  "project_key": "nwcfollowthewhiterabbit/telegram-receipt-payments",
+  "source_revision": "cb051cce2c5635a7ae35363234ada3a568abbc65",
+  "event": "implemented",
+  "feature": {
+    "local_id": "explicit-crm-database-target",
+    "name": "Explicit CRM database identity guard",
+    "description": "Requires the declared target, parsed connection target and actual connected database to match before startup and on each CRM write transaction.",
+    "business_problem": "Promoting an accepted integration from a test database can otherwise route accounting records to an unintended database through inconsistent connection settings.",
+    "category": "integration"
+  },
+  "implementation": {
+    "kind": "original",
+    "apps": ["receipt-paybot"],
+    "modules": ["src.connectors.crm.terrasoft_mssql", "src.main"],
+    "repository_paths": ["src/connectors/crm/terrasoft_mssql.py", "src/main.py"],
+    "doctypes": []
+  },
+  "dependencies": {
+    "apps": [], "doctypes": [], "frappe_versions": [], "erpnext_versions": [],
+    "external_services": ["Microsoft SQL Server"]
+  },
+  "relationships": {"capability_ids": [], "observation_ids": []},
+  "differences": [],
+  "evidence": {
+    "repository_paths": ["docs/crm-production-cutover.md", "docs/10-agent-handoffs/records/2026/2026-10-27-crm-target-guard.md"],
+    "test_paths": ["tests/test_terrasoft_target_safety.py"],
+    "adr_paths": []
+  },
+  "privacy_review": {
+    "reviewed": true, "contains_raw_feedback": false, "contains_personal_data": false,
+    "contains_secrets": false, "contains_runtime_urls": false
+  }
+}
