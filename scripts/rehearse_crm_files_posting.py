@@ -46,7 +46,7 @@ RehearsalError = backup.VerificationError
 MUTATED_TABLES = (
     "tbl_Account", "tbl_Contract", "tbl_Offering", "tbl_OfferingType",
     "tbl_OfferingInContract", "tbl_Cashflow", "tbl_CashflowRight",
-    "tbl_Period", "tbl_Files", "tbl_FilesRight", "tbl_FileInCashflow",
+    "tbl_Period", "tbl_Files", "tbl_FilesRight", "tbl_FileInCashflow", "tbl_CashflowInCashflow",
 )
 
 
@@ -304,6 +304,19 @@ class Scenario:
             FROM dbo.tbl_Cashflow WHERE ID=CONVERT(uniqueidentifier,:id)""",
                                 {"id":operation_id}).mappings().one())
 
+    def transfer_link_fixture(self, operation_id: str, child_id: str) -> str:
+        # Native Cashflow.LinkID references the relationship row, not another
+        # Cashflow. Use a valid relationship to exercise the application guard
+        # without dooming the SQL transaction through a foreign-key failure.
+        link_id = self.new_id("tbl_CashflowInCashflow")
+        self.execute("""INSERT INTO dbo.tbl_CashflowInCashflow (ID,ParentID,ChildID)
+            VALUES (CONVERT(uniqueidentifier,:id),CONVERT(uniqueidentifier,:parent),
+                    CONVERT(uniqueidentifier,:child))""",
+                     {"id":link_id,"parent":operation_id,"child":child_id})
+        self.execute("""UPDATE dbo.tbl_Cashflow SET LinkID=CONVERT(uniqueidentifier,:linked)
+            WHERE ID=CONVERT(uniqueidentifier,:id)""", {"id":operation_id,"linked":link_id})
+        return link_id
+
     def expect_conflict(self, action, code: str) -> None:
         try:
             action()
@@ -366,8 +379,7 @@ class Scenario:
                              "crm_settlement_snapshot_mismatch")
         nested = self.connection.begin_nested()
         try:
-            self.execute("""UPDATE dbo.tbl_Cashflow SET LinkID=CONVERT(uniqueidentifier,:linked)
-                WHERE ID=CONVERT(uniqueidentifier,:id)""", {"id":operation_id,"linked":self.ids["tbl_Cashflow"][1]})
+            self.transfer_link_fixture(operation_id,self.ids["tbl_Cashflow"][1])
             self.expect_conflict(lambda: service.post(operation_id,payload,evidence), "crm_posting_link_requires_review")
         finally:
             nested.rollback()

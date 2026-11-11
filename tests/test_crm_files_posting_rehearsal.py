@@ -172,6 +172,22 @@ class DependencyGuardTests(unittest.TestCase):
 
 
 class RehearsalExecutionTests(unittest.TestCase):
+    def test_transfer_guard_fixture_uses_native_relation_foreign_key(self):
+        scenario=rehearsal.Scenario(MagicMock(),MagicMock(),RUN)
+        scenario.execute=MagicMock()
+        parent="00000000-0000-0000-0000-000000000001"
+        child="00000000-0000-0000-0000-000000000002"
+        link_id=scenario.transfer_link_fixture(parent,child)
+        insert_sql,insert_values=scenario.execute.call_args_list[0].args
+        update_sql,update_values=scenario.execute.call_args_list[1].args
+        self.assertIn("INSERT INTO dbo.tbl_CashflowInCashflow",insert_sql)
+        self.assertEqual(insert_values,{"id":link_id,"parent":parent,"child":child})
+        self.assertIn("UPDATE dbo.tbl_Cashflow",update_sql)
+        self.assertEqual(update_values,{"id":parent,"linked":link_id})
+        self.assertNotEqual(link_id,child)
+        self.assertEqual(scenario.ids["tbl_CashflowInCashflow"],[link_id])
+        self.assertIn("tbl_CashflowInCashflow",rehearsal.MUTATED_TABLES)
+
     def test_all_fixture_writes_roll_back_and_are_verified(self):
         connection=MagicMock()
         scenario=MagicMock(spec=rehearsal.Scenario)
