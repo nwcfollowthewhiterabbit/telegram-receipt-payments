@@ -5,7 +5,11 @@ import datetime as dt
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -107,6 +111,104 @@ class ComposeEnvironmentTest(unittest.TestCase):
             backup_bot.compose_environment()
 
 
+class PrivateBackupFilesTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name).resolve()
+        self.root = self.home / 'runtime'
+        self.receipts = self.root / 'data/receipts'
+        self.private = self.receipts / '_bank_confirmations/synthetic-operation'
+        self.private.mkdir(parents=True, mode=0o700)
+        os.chmod(self.private.parent, 0o700)
+        self.secret_bytes = b'synthetic-private-confirmation-body'
+        self.proof = self.private / 'synthetic-proof'
+        self.proof.write_bytes(self.secret_bytes)
+        os.chmod(self.proof, 0o600)
+        self.outside_override = self.home / 'compose.release.yml'
+        self.outside_override.write_text('services:\n  bot:\n    image: synthetic-old-image\n')
+        (self.root / 'docker-compose.override.yml').symlink_to(self.outside_override)
+        (self.root / 'docker-compose.yml').write_text('services: {}\n')
+        (self.root / '.env').write_text('SYNTHETIC_CONFIG=private\n')
+        self.files = ['.env', 'docker-compose.yml', 'docker-compose.override.yml', 'data/receipts']
+        self.actual_run = subprocess.run
+
+    def assert_readonly_command(self, args, program):
+        self.assertEqual(args[:3], ['docker', 'run', '--rm'])
+        self.assertEqual(args[args.index('--network') + 1], 'none')
+        self.assertIn('--read-only', args)
+        self.assertEqual(args[args.index('--user') + 1], '0:0')
+        self.assertEqual(args[args.index('--entrypoint') + 1], program)
+        self.assertIn(OLD_IMAGE, args)
+        mounts = [args[i + 1] for i, word in enumerate(args) if word == '--mount']
+        self.assertTrue(mounts)
+        self.assertTrue(all(m.endswith(',readonly') for m in mounts))
+        self.assertNotIn('--privileged', args)
+        return mounts
+
+    def test_fixed_hash_helper_includes_private_confirmation_and_does_not_print_it(self):
+        def emulate_reader(args, **kwargs):
+            mounts = self.assert_readonly_command(args, 'python')
+            self.assertEqual(mounts, [f'type=bind,src={self.receipts},dst=/source,readonly'])
+            code = args[-1].replace('Path("/source")', f'Path({str(self.receipts)!r})')
+            result = self.actual_run([sys.executable, '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0)
+            return result.stdout
+        output = io.StringIO()
+        with patch.object(backup_bot, 'run', side_effect=emulate_reader), redirect_stdout(output):
+            result = backup_bot.container_tree_hash(self.receipts, OLD_IMAGE)
+        self.assertEqual(result, {'_bank_confirmations/synthetic-operation/synthetic-proof': hashlib.sha256(self.secret_bytes).hexdigest()})
+        self.assertEqual(output.getvalue(), '')
+        self.assertEqual(self.proof.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.private.stat().st_mode & 0o777, 0o700)
+
+    def test_unreadable_directory_is_failure_not_an_incomplete_hash_tree(self):
+        def denied_walk(root, *, onerror, followlinks):
+            onerror(PermissionError('synthetic inaccessible directory'))
+            return iter(())
+        with patch.object(backup_bot.os, 'walk', side_effect=denied_walk), \
+             self.assertRaisesRegex(RuntimeError, '^receipt_tree_unreadable$'):
+            backup_bot.tree_hash(self.receipts)
+
+    def test_symlink_and_special_file_cannot_disappear_from_hash_inventory(self):
+        link = self.receipts / 'linked'
+        link.symlink_to(self.proof)
+        with self.assertRaisesRegex(RuntimeError, 'symlinks'):
+            backup_bot.tree_hash(self.receipts)
+        link.unlink()
+        os.mkfifo(self.receipts / 'special')
+        with self.assertRaisesRegex(RuntimeError, 'special_file'):
+            backup_bot.tree_hash(self.receipts)
+
+    def test_archive_streams_private_files_and_exact_external_override_without_write_mount(self):
+        target = self.home / 'archive.tar.gz'
+        def emulate_tar(args, **kwargs):
+            mounts = self.assert_readonly_command(args, 'tar')
+            self.assertEqual(mounts, [f'type=bind,src={self.root},dst={self.root},readonly',
+                                      f'type=bind,src={self.outside_override},dst={self.outside_override},readonly'])
+            self.assertIsNot(kwargs['stdout'], subprocess.PIPE)
+            self.assertEqual(kwargs['stderr'], subprocess.PIPE)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            return self.actual_run(['tar', *args[args.index(OLD_IMAGE) + 1:]], **kwargs)
+        with patch.object(backup_bot, 'ROOT', self.root), patch.object(backup_bot.subprocess, 'run', side_effect=emulate_tar):
+            backup_bot.archive_runtime_files(OLD_IMAGE, target, self.files)
+        with tarfile.open(target, 'r:gz') as archive:
+            self.assertEqual(archive.extractfile('data/receipts/_bank_confirmations/synthetic-operation/synthetic-proof').read(), self.secret_bytes)
+            self.assertEqual(archive.extractfile('docker-compose.override.yml').read(), self.outside_override.read_bytes())
+        self.assertEqual(self.proof.stat().st_mode & 0o777, 0o600)
+
+    def test_archive_error_is_sanitized_and_existing_archive_is_never_overwritten(self):
+        target = self.home / 'archive.tar.gz'
+        failure = SimpleNamespace(returncode=2, stderr=b'PRIVATE_SOURCE_PATH_AND_CONFIG')
+        with patch.object(backup_bot, 'ROOT', self.root), patch.object(backup_bot.subprocess, 'run', return_value=failure) as run:
+            with self.assertRaisesRegex(RuntimeError, '^runtime_archive_failed$'):
+                backup_bot.archive_runtime_files(OLD_IMAGE, target, self.files)
+            run.reset_mock()
+            with self.assertRaises(FileExistsError):
+                backup_bot.archive_runtime_files(OLD_IMAGE, target, self.files)
+            run.assert_not_called()
+
+
 class ReleasePlanTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -203,6 +305,8 @@ class ReleasePlanTest(unittest.TestCase):
         if args[:2] == ["docker", "run"]:
             if "--read-only" not in args or "--rm" not in args:
                 raise AssertionError("Unexpected mutable Docker run")
+            if '--entrypoint' in args and args[args.index('--entrypoint') + 1] == 'python':
+                return json.dumps(backup_bot.tree_hash(self.root / 'data/receipts')).encode()
             self.container_stdin.append(kwargs.get("input"))
             return b"candidate_preflight_passed"
         if args[:2] == ["docker", "start"]:
@@ -231,7 +335,10 @@ class ReleasePlanTest(unittest.TestCase):
         result = backup_bot.perform(self.args())
         self.assertEqual(result["mode"], "read_only_plan")
         self.assertFalse((self.backups / ("receipt-paybot-" + RUN)).exists())
-        self.assertFalse(any(args[:2] in (["docker", "run"], ["docker", "stop"], ["docker", "tag"]) for args in self.calls))
+        self.assertFalse(any(args[:2] in (["docker", "stop"], ["docker", "tag"]) for args in self.calls))
+        helpers = [args for args in self.calls if args[:2] == ['docker', 'run']]
+        self.assertEqual(len(helpers), 1)
+        self.assertEqual(helpers[0][helpers[0].index('--network') + 1], 'none')
 
     def test_backup_identity_health_collision_guards_precede_mutation(self):
         for kind in ("image", "revision", "dirty", "health", "collision"):

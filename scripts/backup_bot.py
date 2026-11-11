@@ -9,11 +9,13 @@ import argparse
 import datetime as dt
 import gzip
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 
 ROOT = Path('/home/ubuntu/receipt-paybot')
@@ -54,9 +56,86 @@ def digest(path):
 
 
 def tree_hash(root):
-    if any(p.is_symlink() for p in root.rglob('*')):
-        raise RuntimeError('receipt_symlinks_require_review')
-    return {str(p.relative_to(root)): digest(p) for p in sorted(root.rglob('*')) if p.is_file()}
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError('receipt_tree_invalid')
+    def unreadable(error):
+        raise RuntimeError('receipt_tree_unreadable') from None
+    result = {}
+    try:
+        for directory, folders, files in os.walk(root, onerror=unreadable, followlinks=False):
+            for name in sorted(folders + files):
+                path = Path(directory) / name
+                mode = path.lstat().st_mode
+                if stat.S_ISLNK(mode):
+                    raise RuntimeError('receipt_symlinks_require_review')
+                if stat.S_ISDIR(mode):
+                    continue
+                if not stat.S_ISREG(mode):
+                    raise RuntimeError('receipt_special_file_requires_review')
+                result[str(path.relative_to(root))] = digest(path)
+    except OSError:
+        raise RuntimeError('receipt_tree_unreadable') from None
+    return result
+
+
+def readonly_container(image, mounts, program):
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
+        raise RuntimeError('invalid_reader_image')
+    if program not in {'python', 'tar'}:
+        raise RuntimeError('invalid_reader_program')
+    command = ['docker', 'run', '--rm', '--network', 'none', '--read-only', '--user', '0:0', '--entrypoint', program]
+    for source, target in mounts:
+        source = Path(source)
+        if not source.is_absolute() or any(c in str(source) + str(target) for c in (',', '\n', '\r', '\0')):
+            raise RuntimeError('invalid_reader_mount')
+        command.extend(['--mount', f'type=bind,src={source},dst={target},readonly'])
+    return [*command, image]
+
+
+def container_tree_hash(root, image):
+    """Read private source files as container root; keep names/hashes in memory."""
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError('receipt_tree_invalid')
+    # The baseline image may predate this helper. Execute this exact checkout's
+    # fixed hash implementation, not an import from the old image.
+    code = ('import hashlib,json,os,stat\nfrom pathlib import Path\n'
+            + inspect.getsource(digest) + '\n' + inspect.getsource(tree_hash)
+            + '\nprint(json.dumps(tree_hash(Path("/source")),sort_keys=True))\n')
+    payload = run([*readonly_container(image, [(root, '/source')], 'python'), '-c', code])
+    result = json.loads(payload)
+    if not isinstance(result, dict):
+        raise RuntimeError('receipt_hash_result_invalid')
+    for name, value in result.items():
+        path = Path(name)
+        if (path.is_absolute() or '..' in path.parts or not name
+                or not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{64}', value)):
+            raise RuntimeError('receipt_hash_result_invalid')
+    return result
+
+
+def archive_runtime_files(image, destination, files):
+    required = {'.env', 'docker-compose.yml', 'docker-compose.override.yml', 'data/receipts'}
+    if not required <= set(files) or set(files) - required - {'scripts/smoke_receipt_history.py'}:
+        raise RuntimeError('runtime_archive_entries_invalid')
+    link = ROOT / 'docker-compose.override.yml'
+    if not link.is_symlink():
+        raise RuntimeError('release_override_not_symlink')
+    target = link.resolve(strict=True)
+    if not target.is_file():
+        raise RuntimeError('release_override_target_invalid')
+    # The override is an absolute symlink outside ROOT; mount exactly its file,
+    # never the containing release directory or any writable host location.
+    mounts = [(ROOT, str(ROOT))]
+    if not target.is_relative_to(ROOT):
+        mounts.append((target, str(target)))
+    command = [*readonly_container(image, mounts, 'tar'), '-C', str(ROOT), '-hczf', '-', *files]
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        result = subprocess.run(command, stdout=stream, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise RuntimeError('runtime_archive_failed')
 
 
 def validate_args(args):
@@ -87,7 +166,7 @@ def perform(args):
         raise RuntimeError('backup_target_exists')
     if not (ROOT / 'docker-compose.override.yml').is_symlink():
         raise RuntimeError('release_override_not_symlink')
-    tree_hash(ROOT / 'data/receipts')
+    container_tree_hash(ROOT / 'data/receipts', old_image)
     if not args.execute:
         return {'mode': 'read_only_plan', 'execution_sha': args.execution_sha, 'runtime_image_matches': True, 'backup_target_empty': True}
     os.umask(0o077)
@@ -127,7 +206,7 @@ def perform(args):
         files = ['.env', 'docker-compose.yml', 'docker-compose.override.yml', 'data/receipts']
         if (ROOT / 'scripts/smoke_receipt_history.py').exists():
             files.append('scripts/smoke_receipt_history.py')
-        run(['tar', '-C', str(ROOT), '-hczf', str(backup / 'runtime-files.tar.gz'), *files])
+        archive_runtime_files(old_image, backup / 'runtime-files.tar.gz', files)
         with open(backup / 'database.dump', 'rb') as stream:
             run(['docker', 'exec', '-i', restore, 'pg_restore', '--exit-on-error', '--no-owner', '--no-acl', '-U', 'restorecheck', '-d', 'restorecheck'], stdin=stream)
         live_cmd = ['docker', 'exec', '-i', 'receipt-paybot-db-1', 'sh', '-c', 'exec psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"']
@@ -151,7 +230,7 @@ def perform(args):
         restored_root.mkdir(mode=0o700)
         run(['tar', '-xzf', str(backup / 'runtime-files.tar.gz'), '-C', str(restored_root)])
         checks = {name: digest(ROOT / name) == digest(restored_root / name) for name in files if name != 'data/receipts'}
-        checks['receipts'] = tree_hash(ROOT / 'data/receipts') == tree_hash(restored_root / 'data/receipts')
+        checks['receipts'] = container_tree_hash(ROOT / 'data/receipts', old_image) == tree_hash(restored_root / 'data/receipts')
         if not all(checks.values()):
             raise RuntimeError('file_restore_mismatch')
         shutil.copy2(restored_root / '.env', backup / 'previous.env')
