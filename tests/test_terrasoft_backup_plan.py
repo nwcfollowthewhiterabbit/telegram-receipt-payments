@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager, redirect_stdout
 import copy
+from decimal import Decimal
 import io
 import json
 from pathlib import Path, PureWindowsPath
 import tempfile
 import unittest
 from unittest.mock import MagicMock, Mock, patch
+from uuid import UUID
 
 from scripts import verify_terrasoft_backup as backup
 
@@ -53,7 +55,15 @@ class FakeAdmin:
         if "HEADERONLY" in sql:
             return [dict(DatabaseName="Terrasoft", BackupType=1, IsCopyOnly=True, HasBackupChecksums=True, IsDamaged=False)]
         if "FILELISTONLY" in sql:
-            return [dict(LogicalName="source_data", FileID=1, Type="D", Size=1000), dict(LogicalName="source_log", FileID=2, Type="L", Size=100)]
+            # Column names/casing/types observed read-only on SQL Server 2019;
+            # every value below is synthetic. In particular the field is FileId.
+            return [dict(LogicalName=name, FileId=file_id, Type=kind, Size=size,
+                         PhysicalName=f"D:\\synthetic\\source_{file_id}.bin",
+                         UniqueId=UUID(int=file_id), CreateLSN=Decimal("0"),
+                         FileGroupId=1 if kind == "D" else 0, IsPresent=True,
+                         IsReadOnly=False, TDEThumbprint=None, SnapshotUrl=None)
+                    for name, file_id, kind, size in
+                    (("source_data", 1, "D", 1000), ("source_log", 2, "L", 100))]
         if "SUSER_SNAME" in sql:
             return [{"current_admin": "PRIVATE_ADMIN_SENTINEL"}]
         raise AssertionError("unexpected fake query")
@@ -268,6 +278,21 @@ class BackupExecutionTest(unittest.TestCase):
                 self.run_verification(admin, Path(directory))
             self.assertTrue(admin.backup_created)
             self.assertFalse(any(s.startswith("RESTORE DATABASE") for s in admin.commands))
+
+    def test_incorrect_file_id_column_case_is_not_an_accepted_contract(self):
+        admin = FakeAdmin()
+        original = admin.rows
+        def rows(sql, params=None):
+            result = original(sql, params)
+            if "FILELISTONLY" in sql:
+                for row in result:
+                    row["FileID"] = row.pop("FileId")
+            return result
+        admin.rows = rows
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(backup.VerificationError):
+            self.run_verification(admin, Path(directory))
+        self.assertTrue(admin.backup_created)
+        self.assertFalse(any(s.startswith("RESTORE DATABASE") for s in admin.commands))
 
     def test_cleanup_requires_marker_guid_paths_and_existing_backup(self):
         for mutation in ("owner", "guid", "filehash", "backup"):

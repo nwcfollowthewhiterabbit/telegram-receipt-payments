@@ -319,9 +319,9 @@ def execute_verification(admin: SqlAdmin, plan: BackupPlan, journal: Journal) ->
         headers = admin.rows(f"RESTORE HEADERONLY FROM DISK={literal(plan.backup_path)}")
         require(len(headers) == 1 and headers[0]["DatabaseName"] == SOURCE and headers[0]["BackupType"] == 1 and headers[0]["IsCopyOnly"] and headers[0]["HasBackupChecksums"] and not headers[0]["IsDamaged"], "backup_header_mismatch")
         filelist = admin.rows(f"RESTORE FILELISTONLY FROM DISK={literal(plan.backup_path)} WITH FILE=1")
-        require({(r["LogicalName"], int(r["FileID"]), r["Type"]) for r in filelist} == {(f["logical_name"], f["file_id"], f["type"]) for f in plan.files}, "backup_filelist_changed")
+        require({(r["LogicalName"], int(r["FileId"]), r["Type"]) for r in filelist} == {(f["logical_name"], f["file_id"], f["type"]) for f in plan.files}, "backup_filelist_changed")
         sizes = {f["file_id"]: f["size_bytes"] for f in plan.files}
-        require(all(0 < int(row["Size"]) <= sizes[int(row["FileID"])] for row in filelist), "backup_allocation_changed_replan_required")
+        require(all(0 < int(row["Size"]) <= sizes[int(row["FileId"])] for row in filelist), "backup_allocation_changed_replan_required")
         moves = ", ".join(f"MOVE {literal(f['logical_name'])} TO {literal(f['destination'])}" for f in plan.files)
         stage = "verifyonly"
         admin.command(f"RESTORE VERIFYONLY FROM DISK={literal(plan.backup_path)} WITH FILE=1, CHECKSUM, STOP_ON_ERROR, {moves}")
