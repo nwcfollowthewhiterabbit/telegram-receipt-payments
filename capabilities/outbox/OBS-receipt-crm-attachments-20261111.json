@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "contract_version": "1.0.0",
+  "observation_id": "OBS-receipt-crm-attachments-20261111",
+  "observed_at": "2026-11-11T18:44:35Z",
+  "project_key": "nwcfollowthewhiterabbit/telegram-receipt-payments",
+  "source_revision": "0b2ab046042a26f643d5bb620f28e0ecc429a672",
+  "event": "implemented",
+  "feature": {
+    "local_id": "native-crm-private-attachments",
+    "name": "Idempotent native CRM operation attachments",
+    "description": "Stores original document bytes and confirmed bank evidence in the native file detail with stable identity, integrity checks and parent access inheritance.",
+    "business_problem": "Accountants need source documents on the corresponding financial operation without duplicate or mislinked attachments.",
+    "category": "integration"
+  },
+  "implementation": {
+    "kind": "original",
+    "apps": [
+      "receipt-paybot"
+    ],
+    "modules": [
+      "src.connectors.crm.attachments",
+      "src.connectors.crm.terrasoft_mssql"
+    ],
+    "repository_paths": [
+      "src/connectors/crm/attachments.py",
+      "src/connectors/crm/terrasoft_mssql.py"
+    ],
+    "doctypes": []
+  },
+  "dependencies": {
+    "apps": [],
+    "doctypes": [],
+    "frappe_versions": [],
+    "erpnext_versions": [],
+    "external_services": [
+      "Microsoft SQL Server",
+      "Bank corporate APIs"
+    ]
+  },
+  "relationships": {
+    "capability_ids": [
+      "CAP-SEC-0004",
+      "CAP-SEC-0006"
+    ],
+    "observation_ids": []
+  },
+  "differences": [],
+  "evidence": {
+    "repository_paths": [
+      "docs/crm-files-and-payment-posting.md",
+      "docs/10-agent-handoffs/records/2026/2026-11-11-crm-files-workflow.md"
+    ],
+    "test_paths": [
+      "tests/test_crm_attachments.py",
+      "tests/test_crm_files_posting_rehearsal.py"
+    ],
+    "adr_paths": []
+  },
+  "privacy_review": {
+    "reviewed": true,
+    "contains_raw_feedback": false,
+    "contains_personal_data": false,
+    "contains_secrets": false,
+    "contains_runtime_urls": false
+  }
+}
