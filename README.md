@@ -7,7 +7,7 @@
 [переключение CRM на рабочую базу](docs/crm-production-cutover.md),
 [файлы и подтверждение оплаты в CRM](docs/crm-files-and-payment-posting.md),
 [история изменений](CHANGELOG.md),
-[текущий релиз CRM и backup/rollback](docs/releases/2026-10-27-crm-production.md).
+[текущий релиз CRM и backup/rollback](docs/releases/2026-11-11-crm-files-posting.md).
 
 Docker-проект для Telegram-бота, который:
 
@@ -69,7 +69,7 @@ Docker-проект для Telegram-бота, который:
 - https://api.privatbank.ua/index.html
 - https://docs.google.com/document/d/e/2PACX-1vTtKvGa3P4E-lDqLg3bHRF6Wi9S7GIjSMFEFxII5qQZBGxuTXs25hQNiUU1hMZQhOyx6BNvIZ1bVKSr/pub
 
-Поэтому в проекте банковская логика вынесена отдельно в [src/clients/privat24.py](/home/wroot/receipt-paybot/src/clients/privat24.py:1) и [src/clients/monobank.py](/home/wroot/receipt-paybot/src/clients/monobank.py:1). По умолчанию для безопасности оставлены dry-run режимы.
+Поэтому в проекте банковская логика вынесена отдельно в [src/clients/privat24.py](src/clients/privat24.py) и [src/clients/monobank.py](src/clients/monobank.py). По умолчанию для безопасности оставлены dry-run режимы.
 
 CRM-интеграция выбирается через `CRM_PROVIDER`. Сейчас доступны:
 
@@ -78,18 +78,19 @@ CRM-интеграция выбирается через `CRM_PROVIDER`. Сей�
 
 Для Terrasoft live-режима нужны `TERRASOFT_MSSQL_URL` и `TERRASOFT_INVOICE_TABLE`. До согласования точной таблицы и колонок держите `CRM_DRY_RUN=true`: бот сохранит в аудит payload, который ушел бы в CRM.
 
-## Файлы и подтверждение оплаты в CRM — кандидат на включение
+## Файлы и подтверждение оплаты в CRM
 
-Этот процесс подготовлен в исходниках; его установка и включение должны быть
-подтверждены отдельным release evidence. По умолчанию
-`CRM_FILES_AND_POSTING_ENABLED=false`. Текущая установленная версия описана в
-[инструкции пользователю](docs/user-manual.uk.md).
+С 11.11.2026, 20:27 UTC, процесс включён в рабочей `Terrasoft` для новых
+обработок. [Release evidence](docs/releases/2026-11-11-crm-files-posting.md)
+фиксирует установленный image, backup/restore, rehearsal и runtime checks.
+В исходной конфигурации default `CRM_FILES_AND_POSTING_ENABLED=false`;
+установленный release включает возможность явно.
 
-После разрешённого включения для **новых** банковских черновиков бот создаёт
-CRM-операцию с оригиналом счёта. Человек проверяет и подписывает платёж в банке.
-Бот проводит эту же CRM-операцию только после подтверждения исполнения банка и
-добавления подтверждающего файла. Старые платежи автоматически в новый процесс
-не включаются. Повторная проверка после сбоя использует ту же операцию.
+Для **новых** банковских черновиков бот создаёт CRM-операцию с оригиналом
+счёта. Человек проверяет и подписывает платёж в банке. После подтверждённого
+исполнения бот прикладывает подтверждающий файл и проводит ту же операцию
+одной CRM-транзакцией. Исторические платежи в процесс не включаются.
+Повтор после временного сбоя использует сохранённую операцию.
 
 Privat24 предоставляет PDF-квитанцию. Для monobank сохраняются полученные от
 банка данные выписки в JSON; PDF автоматически не получается. Если бухгалтеру
@@ -108,6 +109,14 @@ Privat24 предоставляет PDF-квитанцию. Для monobank со
 успешного exact-SHA CI, проверенных backup/restore локальных данных и внешней
 CRM, а также проверки нового процесса на восстановленной копии.
 [Контракт и ограничения](docs/crm-files-and-payment-posting.md).
+
+На момент установки приёмка первой обычной оплаты и открытия файлов под
+ролью бухгалтера ещё ожидается; live банковский E2E при установке не
+выполнялся. Бухгалтер проверяет реквизиты, файлы, состояние и фактическую
+дату той же операции по [инструкции](docs/user-manual.uk.md#файли-та-підтвердження-оплати).
+Существующий fixed CashAccount mapping для обоих банков сохраняется и
+отдельно сверяется с фактическим счётом списания. Старый счёт не нужно
+загружать повторно ради проверки или переноса истории.
 
 ## Быстрый старт
 
@@ -196,18 +205,18 @@ python3 -m scripts.test_invoice_parsing /path/to/invoices
 
 ## Структура
 
-- [docs/ARCHITECTURE_ROADMAP.md](/home/wroot/receipt-paybot/docs/ARCHITECTURE_ROADMAP.md:1) — архитектурный регламент, roadmap и вопросы для финализации требований.
-- [src/main.py](/home/wroot/receipt-paybot/src/main.py:1) — точка входа.
-- [src/bot/handlers.py](/home/wroot/receipt-paybot/src/bot/handlers.py:1) — Telegram-обработчики.
-- [src/services/receipt_pipeline.py](/home/wroot/receipt-paybot/src/services/receipt_pipeline.py:1) — пайплайн счета на оплату.
-- [src/connectors/payments/registry.py](/home/wroot/receipt-paybot/src/connectors/payments/registry.py:1) — выбор платежного коннектора.
-- [src/connectors/crm/registry.py](/home/wroot/receipt-paybot/src/connectors/crm/registry.py:1) — выбор CRM-коннектора.
-- [src/connectors/communication/registry.py](/home/wroot/receipt-paybot/src/connectors/communication/registry.py:1) — выбор коммуникационного adapter.
-- [src/services/vision.py](/home/wroot/receipt-paybot/src/services/vision.py:1) — OCR/vision-валидация счета.
-- [src/clients/privat24.py](/home/wroot/receipt-paybot/src/clients/privat24.py:1) — адаптер Privat24.
-- [src/connectors/payments/privat24_receipt_monitor.py](/home/wroot/receipt-paybot/src/connectors/payments/privat24_receipt_monitor.py:1) — Privat24-specific монитор квитанций.
-- [src/clients/monobank.py](/home/wroot/receipt-paybot/src/clients/monobank.py:1) — адаптер monobank.
-- [src/connectors/crm/terrasoft_mssql.py](/home/wroot/receipt-paybot/src/connectors/crm/terrasoft_mssql.py:1) — адаптер Terrasoft/XRM v3 через MS SQL.
+- [docs/ARCHITECTURE_ROADMAP.md](docs/ARCHITECTURE_ROADMAP.md) — архитектурный регламент, roadmap и вопросы для финализации требований.
+- [src/main.py](src/main.py) — точка входа.
+- [src/bot/handlers.py](src/bot/handlers.py) — Telegram-обработчики.
+- [src/services/receipt_pipeline.py](src/services/receipt_pipeline.py) — пайплайн счета на оплату.
+- [src/connectors/payments/registry.py](src/connectors/payments/registry.py) — выбор платежного коннектора.
+- [src/connectors/crm/registry.py](src/connectors/crm/registry.py) — выбор CRM-коннектора.
+- [src/connectors/communication/registry.py](src/connectors/communication/registry.py) — выбор коммуникационного adapter.
+- [src/services/vision.py](src/services/vision.py) — OCR/vision-валидация счета.
+- [src/clients/privat24.py](src/clients/privat24.py) — адаптер Privat24.
+- [src/connectors/payments/privat24_receipt_monitor.py](src/connectors/payments/privat24_receipt_monitor.py) — Privat24-specific монитор квитанций.
+- [src/clients/monobank.py](src/clients/monobank.py) — адаптер monobank.
+- [src/connectors/crm/terrasoft_mssql.py](src/connectors/crm/terrasoft_mssql.py) — адаптер Terrasoft/XRM v3 через MS SQL.
 
 ## Проверка архитектуры
 
@@ -216,7 +225,7 @@ python -m scripts.check_architecture
 ```
 
 Скрипт проверяет, что service layer не импортирует Telegram/aiogram напрямую, и что registry собирает активные payment/CRM connectors.
-- [src/db/models.py](/home/wroot/receipt-paybot/src/db/models.py:1) — модели БД.
+- [src/db/models.py](src/db/models.py) — модели БД.
 
 ## Что я бы сделал следующим шагом
 
