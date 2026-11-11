@@ -6,6 +6,11 @@ must first push the source and verify successful exact-SHA CI, then run with
 The restored database and backup are retained. Cleanup is a separate command:
 --execute --cleanup VERIFIED_JSON (plus the same execution/evidence arguments).
 It drops only the owned, verified clone and NEVER removes the backup file.
+To recheck a retained restricted clone after a verifier-only correction:
+--revalidate-existing OLD_DIR/RUN-003-restore_restricted.json --execute
+--execution-sha NEW_SHA --ci-run-id NEW_CI --evidence-dir NEW_EMPTY_PRIVATE_DIR.
+Mount the entire OLD_DIR read-only so its 000..003 journal chain is available.
+This repeats checksum/physical/schema/attachment checks, never backup or restore.
 
 The supported target is the existing Windows SQL Server 2019+ Terrasoft with
 ordinary ROWS/LOG files. No arbitrary target, directory, SQL or restore name is
@@ -208,7 +213,7 @@ class SqlAdmin:
         db = identifier(name)
         # Read length metadata for every native blob, but hash at most three
         # deterministic bodies on the CLONE to avoid scanning all 20+ GB twice.
-        totals = self.rows(f"SELECT COUNT_BIG(*) AS file_rows,COUNT_BIG(FileData) AS blob_rows,COALESCE(SUM(CONVERT(bigint,DATALENGTH(FileData))),0) AS blob_bytes,SUM(CASE WHEN FileData IS NOT NULL AND FileSize<>DATALENGTH(FileData) THEN CONVERT(bigint,1) ELSE 0 END) AS size_metadata_mismatches FROM {db}.dbo.tbl_Files")[0]
+        totals = self.rows(f"SELECT COUNT_BIG(*) AS file_rows,COUNT_BIG(CASE WHEN FileData IS NOT NULL THEN 1 END) AS blob_rows,COALESCE(SUM(CONVERT(bigint,DATALENGTH(FileData))),0) AS blob_bytes,SUM(CASE WHEN FileData IS NOT NULL AND FileSize<>DATALENGTH(FileData) THEN CONVERT(bigint,1) ELSE 0 END) AS size_metadata_mismatches FROM {db}.dbo.tbl_Files")[0]
         samples = self.rows(f"SELECT TOP (3) DATALENGTH(FileData) AS bytes,CONVERT(varchar(64),HASHBYTES('SHA2_256',CONVERT(varbinary(max),FileData)),2) AS digest FROM {db}.dbo.tbl_Files WHERE FileData IS NOT NULL ORDER BY ID")
         require(all(re.fullmatch(r"[0-9A-Fa-f]{64}", row["digest"] or "") for row in samples), "attachment_read_failed")
         links = self.rows(f"SELECT COUNT_BIG(*) AS link_rows,SUM(CASE WHEN f.ID IS NULL OR c.ID IS NULL THEN CONVERT(bigint,1) ELSE 0 END) AS orphan_links FROM {db}.dbo.tbl_FileInCashflow l LEFT JOIN {db}.dbo.tbl_Files f ON f.ID=l.FileID LEFT JOIN {db}.dbo.tbl_Cashflow c ON c.ID=l.CashflowID")[0]
@@ -369,16 +374,133 @@ def execute_verification(admin: SqlAdmin, plan: BackupPlan, journal: Journal) ->
         raise VerificationError(code) from None
 
 
-def read_verified_evidence(path: Path) -> dict:
+def read_journal_record(path: Path) -> dict:
     require(path.is_file() and not path.is_symlink(), "verified_evidence_required")
     data = json.loads(path.read_text())
     digest = data.pop("record_sha256", None)
     require(fingerprint(data) == digest, "evidence_digest_mismatch")
     data["record_sha256"] = digest
     validate_run_id(data.get("run_id", ""))
-    require(data.get("schema_version") == SCHEMA_VERSION and data.get("stage") == "verified" and data.get("verified") is True, "evidence_not_verified")
+    require(data.get("schema_version") == SCHEMA_VERSION, "evidence_schema_mismatch")
     require(data.get("restore_database") == CLONE_PREFIX + data["run_id"], "evidence_clone_mismatch")
     return data
+
+
+def read_verified_evidence(path: Path) -> dict:
+    data = read_journal_record(path)
+    require(data.get("stage") == "verified" and data.get("verified") is True, "evidence_not_verified")
+    return data
+
+
+def read_existing_restore(path: Path) -> dict:
+    """Require the complete original backup → restricted restore journal chain."""
+    evidence = read_journal_record(path)
+    require(evidence.get("stage") == "restore_restricted", "restricted_restore_evidence_required")
+    require(re.fullmatch(r"[0-9a-f]{40}", evidence.get("execution_sha", ""))
+            and re.fullmatch(r"[0-9]+", evidence.get("ci_run_id", "")), "original_execution_identity_required")
+    previous = None
+    context_keys = ("run_id", "restore_database", "backup_basename", "source_database_guid",
+                    "server_fingerprint", "source_file_count", "allocated_bytes", "headroom_multiplier",
+                    "restore_file_paths_sha256", "backup_path_sha256", "execution_sha", "ci_run_id")
+    stages = ("started", "backup_complete", "backup_verified", "restore_restricted")
+    for sequence, stage in enumerate(stages):
+        sibling = path.parent / f"{evidence['run_id']}-{sequence:03d}-{stage}.json"
+        record = read_journal_record(sibling)
+        require(record.get("stage") == stage and record.get("previous_record_sha256") == previous,
+                "original_evidence_chain_mismatch")
+        require(all(record.get(key) == evidence[key] for key in context_keys), "original_evidence_context_mismatch")
+        if stage == "backup_complete":
+            require(record.get("backup_retained") is True, "original_backup_incomplete")
+        if stage == "backup_verified":
+            require(record.get("backup_checksum_verified") is True, "original_backup_not_verified")
+        previous = record["record_sha256"]
+    require(previous == evidence["record_sha256"], "original_restore_record_mismatch")
+    return evidence
+
+
+def inspect_existing_restore(admin: SqlAdmin, evidence: dict) -> tuple[str, dict, dict]:
+    """Fresh identity check; never grants ownership from a name alone."""
+    run_id = validate_run_id(evidence["run_id"])
+    name = CLONE_PREFIX + run_id
+    require(evidence["restore_database"] == name, "evidence_clone_mismatch")
+    metadata = admin.metadata()
+    require(metadata["is_sysadmin"] == 1 and fingerprint(metadata["server_identity"]) == evidence["server_fingerprint"]
+            and metadata["source_guid"] == evidence["source_database_guid"], "revalidation_source_identity_mismatch")
+    identity = admin.clone_identity(name)
+    require(identity["owner"] == run_id and identity["database_guid"] == evidence["clone_database_guid"]
+            and identity["database_id"] == evidence["clone_database_id"]
+            and str(identity["create_date"]) == evidence["clone_create_date"], "revalidation_clone_identity_mismatch")
+    require(identity["state_desc"] == "ONLINE" and identity["user_access_desc"] == "RESTRICTED_USER"
+            and identity["public_connect_denied"] and not identity["is_broker_enabled"]
+            and not identity["is_trustworthy_on"] and not identity["is_db_chaining_on"], "clone_access_isolation_failed")
+    require(identity["restore_file_paths_sha256"] == evidence["restore_file_paths_sha256"], "clone_file_identity_mismatch")
+    basename = BACKUP_PREFIX + run_id + ".bak"
+    require(evidence["backup_basename"] == basename, "revalidation_backup_name_mismatch")
+    backup = str(local_directory(metadata["backup_dir"] or "") / basename)
+    found = admin.file_exists(backup)
+    require(fingerprint(backup.casefold()) == evidence["backup_path_sha256"] and found["file"]
+            and not found["directory"], "revalidation_backup_missing_or_changed")
+    return backup, identity, metadata
+
+
+def revalidate_existing_restore(admin: SqlAdmin, evidence: dict, journal: Journal) -> dict:
+    """Recheck an owned restored copy. No BACKUP, database restore, ALTER or DROP."""
+    stage = "existing_identity"
+    try:
+        backup, identity, _ = inspect_existing_restore(admin, evidence)
+        name = evidence["restore_database"]
+        journal.write("revalidation_started", verified=False)
+        stage = "backup_metadata"
+        headers = admin.rows(f"RESTORE HEADERONLY FROM DISK={literal(backup)}")
+        require(len(headers) == 1 and headers[0]["DatabaseName"] == SOURCE and headers[0]["BackupType"] == 1
+                and headers[0]["IsCopyOnly"] and headers[0]["HasBackupChecksums"] and not headers[0]["IsDamaged"], "backup_header_mismatch")
+        history = admin.rows("""
+            SELECT CONVERT(nvarchar(36),b.backup_set_uuid) AS backup_set_uuid,
+              CONVERT(nvarchar(36),b.database_guid) AS source_guid,
+              r.restore_type,r.[replace] AS used_replace,r.recovery,b.database_name,b.type AS backup_type
+            FROM msdb.dbo.restorehistory r JOIN msdb.dbo.backupset b ON b.backup_set_id=r.backup_set_id
+            WHERE r.destination_database_name=:name AND r.restore_type<>'V'
+            ORDER BY r.restore_history_id
+        """, {"name": name})
+        require(len(history) == 1, "revalidation_restore_history_ambiguous")
+        restored = history[0]
+        require(restored["restore_type"] == "D" and restored["backup_type"] == "D"
+                and restored["database_name"] == SOURCE and restored["used_replace"] == 0 and restored["recovery"] == 1
+                and UUID(str(restored["backup_set_uuid"])) == UUID(str(headers[0]["BackupSetGUID"]))
+                and UUID(str(restored["source_guid"])) == UUID(evidence["source_database_guid"])
+                and UUID(str(headers[0]["BindingID"])) == UUID(evidence["source_database_guid"]),
+                "revalidation_backup_restore_lineage_mismatch")
+        filelist = admin.rows(f"RESTORE FILELISTONLY FROM DISK={literal(backup)} WITH FILE=1")
+        files = admin.rows("SELECT file_id,name AS logical_name,type_desc,CONVERT(bigint,size)*8192 AS size_bytes FROM sys.master_files WHERE database_id=:id ORDER BY file_id", {"id": identity["database_id"]})
+        require(len(files) == len(filelist) == evidence["source_file_count"]
+                and all(f["type_desc"] in {"ROWS", "LOG"} for f in files), "revalidation_filelist_mismatch")
+        require({(f["logical_name"], int(f["file_id"]), "D" if f["type_desc"] == "ROWS" else "L") for f in files}
+                == {(f["LogicalName"], int(f["FileId"]), f["Type"]) for f in filelist}, "revalidation_filelist_mismatch")
+        sizes = {f["file_id"]: int(f["size_bytes"]) for f in files}
+        require(all(0 < int(f["Size"]) <= sizes[int(f["FileId"])] for f in filelist), "revalidation_backup_allocation_mismatch")
+        stage = "verifyonly"
+        admin.command(f"RESTORE VERIFYONLY FROM DISK={literal(backup)} WITH FILE=1, CHECKSUM, STOP_ON_ERROR")
+        journal.write("backup_verified", backup_checksum_verified=True)
+        stage = "checkdb"
+        admin.command(f"DBCC CHECKDB ({identifier(name)}) WITH PHYSICAL_ONLY, NO_INFOMSGS, ALL_ERRORMSGS, MAXDOP=1")
+        journal.write("physical_check_completed", dbcc_physical_only_completed=True)
+        stage = "schema"
+        schema = admin.schema_digest(name)
+        require(schema == admin.schema_digest(SOURCE), "restored_schema_mismatch")
+        stage = "attachment_reads"
+        attachments = admin.attachment_checks(name)
+        inspect_existing_restore(admin, evidence)
+        return journal.write("verified", verified=True, backup_retained=True, restore_retained=True,
+                             clone_database_guid=identity["database_guid"], clone_database_id=identity["database_id"],
+                             clone_create_date=str(identity["create_date"]), dbcc_physical_only_completed=True,
+                             source_schema_matches=True, schema=schema, attachments=attachments,
+                             backup_checksum_verified=True, backup_file_sha256_computed=False,
+                             revalidated_existing_restore=True, backup_restore_lineage_verified=True)
+    except BaseException as exc:
+        code = str(exc) if isinstance(exc, VerificationError) else "revalidation_failed"
+        journal.write("failed", verified=False, failed_stage=stage, error_code=code,
+                      backup_retained=True, restore_retained=True)
+        raise VerificationError(code) from None
 
 
 def cleanup_verified_clone(admin: SqlAdmin, evidence: dict, journal: Journal, *, execute: bool) -> dict:
@@ -409,6 +531,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--execute", action="store_true", help="Mutation only after exact-SHA successful CI and operator authorization")
     parser.add_argument("--cleanup", type=Path, help="Verified JSON for owned clone; read-only preview unless --execute")
+    parser.add_argument("--revalidate-existing", type=Path, help="Original restore_restricted journal; recheck existing copy without backup/restore/deletion")
     parser.add_argument("--keep-restore", action="store_true", default=True, help="Keep clone for further tests (default; cleanup is separate)")
     parser.add_argument("--run-id", default=None, help="UUID4 hex from a reviewed plan; otherwise generate a new UUID4")
     parser.add_argument("--headroom", type=float, default=2.0, help="Required free space / database allocation on each relevant volume; minimum 2")
@@ -419,12 +542,31 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         require(30 <= args.timeout_seconds <= 14400, "invalid_timeout")
+        require(not (args.cleanup and args.revalidate_existing), "conflicting_operations")
+        require(not (args.revalidate_existing and args.run_id), "existing_restore_run_id_is_fixed")
         if args.execute:
             require(bool(re.fullmatch(r"[0-9a-f]{40}", args.execution_sha or "")), "exact_execution_sha_required")
             require(bool(re.fullmatch(r"[0-9]+", args.ci_run_id or "")), "successful_ci_run_reference_required")
             require(args.evidence_dir is not None, "evidence_directory_required")
         with open_admin(args.timeout_seconds) as admin:
-            if args.cleanup:
+            if args.revalidate_existing:
+                evidence = read_existing_restore(args.revalidate_existing)
+                inspect_existing_restore(admin, evidence)
+                if args.execute:
+                    # Original evidence is never rewritten. Keep ownership run_id
+                    # but require a fresh release evidence directory for this run.
+                    require(args.evidence_dir.is_dir() and not any(args.evidence_dir.iterdir()), "fresh_revalidation_evidence_directory_required")
+                    keys = ("run_id", "restore_database", "backup_basename", "source_database_guid",
+                            "server_fingerprint", "source_file_count", "allocated_bytes", "headroom_multiplier",
+                            "restore_file_paths_sha256", "backup_path_sha256")
+                    context = {key: evidence[key] for key in keys}
+                    context.update(execution_sha=args.execution_sha, ci_run_id=args.ci_run_id,
+                                   original_execution_sha=evidence["execution_sha"], original_ci_run_id=evidence["ci_run_id"],
+                                   original_restore_record_sha256=evidence["record_sha256"])
+                    result = revalidate_existing_restore(admin, evidence, Journal(args.evidence_dir, context))
+                else:
+                    result = {"mode": "read_only_revalidation_plan", "restore_database": evidence["restore_database"], "verified": False}
+            elif args.cleanup:
                 evidence = read_verified_evidence(args.cleanup)
                 context = {key: evidence[key] for key in ("run_id", "restore_database", "server_fingerprint", "source_database_guid")}
                 context.update(execution_sha=args.execution_sha, ci_run_id=args.ci_run_id, cleanup_attempt=uuid4().hex)

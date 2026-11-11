@@ -17,6 +17,7 @@ from scripts import verify_terrasoft_backup as backup
 RUN = "12345678123442348234123456789abc"
 SOURCE_GUID = "11111111-2222-3333-4444-555555555555"
 CLONE_GUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+BACKUP_GUID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 
 
 class FakeAdmin:
@@ -53,7 +54,8 @@ class FakeAdmin:
 
     def rows(self, sql, params=None):
         if "HEADERONLY" in sql:
-            return [dict(DatabaseName="Terrasoft", BackupType=1, IsCopyOnly=True, HasBackupChecksums=True, IsDamaged=False)]
+            return [dict(DatabaseName="Terrasoft", BackupType=1, IsCopyOnly=True, HasBackupChecksums=True, IsDamaged=False,
+                         BackupSetGUID=UUID(BACKUP_GUID), BindingID=UUID(SOURCE_GUID))]
         if "FILELISTONLY" in sql:
             # Column names/casing/types observed read-only on SQL Server 2019;
             # every value below is synthetic. In particular the field is FileId.
@@ -66,6 +68,11 @@ class FakeAdmin:
                     (("source_data", 1, "D", 1000), ("source_log", 2, "L", 100))]
         if "SUSER_SNAME" in sql:
             return [{"current_admin": "PRIVATE_ADMIN_SENTINEL"}]
+        if "FROM sys.master_files" in sql:
+            return copy.deepcopy(self.metadata_result["files"])
+        if "FROM msdb.dbo.restorehistory" in sql:
+            return [dict(backup_set_uuid=BACKUP_GUID, source_guid=SOURCE_GUID, restore_type="D",
+                         used_replace=False, recovery=True, database_name="Terrasoft", backup_type="D")]
         raise AssertionError("unexpected fake query")
 
     def command(self, sql):
@@ -91,6 +98,8 @@ class FakeAdmin:
         return dict(catalog_rows=30, schema_sha256="b" * 64 if self.schema_mismatch and name != backup.SOURCE else "a" * 64)
 
     def attachment_checks(self, name):
+        if getattr(self, "attachment_failure", False):
+            raise RuntimeError("PRIVATE_DATABASE_IMAGE_AGGREGATE_ERROR")
         return dict(file_rows=2, blob_rows=2, blob_bytes=100, sampled_bodies=2, sample_hash_reads_valid=True)
 
 
@@ -340,6 +349,183 @@ class BackupExecutionTest(unittest.TestCase):
             self.assertTrue(list(Path(directory).glob("*-cleanup_failed.json")))
         self.assertTrue(admin.clone and admin.backup_created)
         self.assertFalse(any(s.startswith("DROP DATABASE") for s in admin.commands))
+
+
+class ExistingRestoreRevalidationTest(unittest.TestCase):
+    ORIGINAL_SHA = "a" * 40
+    NEW_SHA = "b" * 40
+
+    def fixture(self, root):
+        old = root / "old"
+        new = root / "new"
+        old.mkdir(mode=0o700)
+        new.mkdir(mode=0o700)
+        admin = FakeAdmin()
+        plan = backup.build_plan(admin, RUN)
+        context = {**plan.public(), "execution_sha": self.ORIGINAL_SHA, "ci_run_id": "123"}
+        admin.attachment_failure = True
+        with redirect_stdout(io.StringIO()), self.assertRaises(backup.VerificationError):
+            backup.execute_verification(admin, plan, backup.Journal(old, context))
+        admin.attachment_failure = False
+        admin.commands.clear()
+        return admin, old / f"{RUN}-003-restore_restricted.json", new
+
+    def execute(self, admin, old, new):
+        with patch.object(backup, "open_admin", return_value=fake_connection(admin)), redirect_stdout(io.StringIO()):
+            return backup.main(["--revalidate-existing", str(old), "--execute",
+                                "--execution-sha", self.NEW_SHA, "--ci-run-id", "456", "--evidence-dir", str(new)])
+
+    def test_default_revalidation_only_reads_identity_and_never_writes_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            admin, old, new = self.fixture(Path(directory))
+            output = io.StringIO()
+            with patch.object(backup, "open_admin", return_value=fake_connection(admin)), redirect_stdout(output):
+                self.assertEqual(backup.main(["--revalidate-existing", str(old)]), 0)
+            self.assertEqual(json.loads(output.getvalue())["mode"], "read_only_revalidation_plan")
+            self.assertFalse(admin.commands)
+            self.assertFalse(list(new.iterdir()))
+
+    def test_revalidation_rechecks_every_stage_without_backup_restore_or_deletion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            admin, old, new = self.fixture(Path(directory))
+            old_content = {p.name: p.read_bytes() for p in old.parent.iterdir()}
+            prior = backup.read_existing_restore(old)
+            self.assertEqual(self.execute(admin, old, new), 0)
+            verified = backup.read_verified_evidence(new / f"{RUN}-003-verified.json")
+            self.assertEqual(verified["execution_sha"], self.NEW_SHA)
+            self.assertEqual(verified["ci_run_id"], "456")
+            self.assertEqual(verified["original_execution_sha"], self.ORIGINAL_SHA)
+            self.assertEqual(verified["original_ci_run_id"], "123")
+            self.assertEqual(verified["original_restore_record_sha256"], prior["record_sha256"])
+            self.assertTrue(verified["revalidated_existing_restore"])
+            self.assertTrue(verified["backup_restore_lineage_verified"])
+            self.assertTrue(verified["backup_checksum_verified"] and verified["dbcc_physical_only_completed"])
+            self.assertEqual(old_content, {p.name: p.read_bytes() for p in old.parent.iterdir()})
+        self.assertEqual(len(admin.commands), 2)
+        self.assertTrue(admin.commands[0].startswith("RESTORE VERIFYONLY"))
+        self.assertTrue(admin.commands[1].startswith("DBCC CHECKDB"))
+        self.assertTrue(admin.clone and admin.backup_created)
+
+    def test_original_chain_missing_tampered_or_relinked_is_rejected(self):
+        for mutation in ("missing", "tampered", "relinked", "context", "wrong_stage"):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(mutation=mutation):
+                admin, old, new = self.fixture(Path(directory))
+                selected = old.parent / f"{RUN}-001-backup_complete.json"
+                if mutation == "missing":
+                    selected.unlink()
+                else:
+                    data = json.loads(selected.read_text())
+                    if mutation == "tampered": data["backup_retained"] = False
+                    if mutation == "relinked": data["previous_record_sha256"] = "0" * 64
+                    if mutation == "context": data["execution_sha"] = "c" * 40
+                    if mutation == "wrong_stage": data["stage"] = "verified"
+                    if mutation != "tampered":
+                        data.pop("record_sha256")
+                        data["record_sha256"] = backup.fingerprint(data)
+                    selected.write_text(json.dumps(data))
+                self.assertEqual(self.execute(admin, old, new), 1)
+                self.assertFalse(admin.commands)
+                self.assertFalse(list(new.iterdir()))
+
+    def test_changed_clone_source_privileges_or_backup_blocks_all_physical_checks(self):
+        for mutation in ("owner", "guid", "paths", "source", "server", "privileges", "backup"):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(mutation=mutation):
+                admin, old, new = self.fixture(Path(directory))
+                if mutation == "owner": admin.owner = "different_owner"
+                if mutation == "guid": admin.guid = SOURCE_GUID
+                if mutation == "paths": admin.metadata_result["data_dir"] = "D:\\different"
+                if mutation == "source": admin.metadata_result["source_guid"] = CLONE_GUID
+                if mutation == "server": admin.metadata_result["server_identity"] = "different_server"
+                if mutation == "privileges": admin.metadata_result["is_sysadmin"] = 0
+                if mutation == "backup": admin.backup_created = False
+                self.assertEqual(self.execute(admin, old, new), 1)
+                self.assertFalse(admin.commands)
+                self.assertFalse(list(new.iterdir()))
+
+    def test_revalidation_cannot_overwrite_or_append_to_prior_evidence_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            admin, old, new = self.fixture(Path(directory))
+            self.assertEqual(self.execute(admin, old, old.parent), 1)
+            self.assertFalse(admin.commands)
+            self.assertEqual(self.execute(admin, old, new), 0)
+            admin.commands.clear()
+            self.assertEqual(self.execute(admin, old, new), 1)
+            self.assertFalse(admin.commands)
+
+    def test_revalidation_rejects_backup_set_or_source_that_did_not_restore_this_clone(self):
+        for mutation in ("backup_set_uuid", "source_guid", "BindingID", "used_replace", "restore_type", "recovery"):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(mutation=mutation):
+                admin, old, new = self.fixture(Path(directory))
+                original = admin.rows
+                def rows(sql, params=None):
+                    result = original(sql, params)
+                    if "FROM msdb.dbo.restorehistory" in sql:
+                        if mutation in {"backup_set_uuid", "source_guid"}: result[0][mutation] = CLONE_GUID
+                        if mutation == "used_replace": result[0][mutation] = True
+                        if mutation == "restore_type": result[0][mutation] = "L"
+                        if mutation == "recovery": result[0][mutation] = False
+                    if "HEADERONLY" in sql and mutation == "BindingID": result[0][mutation] = UUID(CLONE_GUID)
+                    return result
+                admin.rows = rows
+                self.assertEqual(self.execute(admin, old, new), 1)
+                self.assertFalse(admin.commands)
+                self.assertFalse(list(new.glob("*-verified.json")))
+
+    def test_revalidation_requires_one_unambiguous_database_restore_history(self):
+        for count in (0, 2):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(count=count):
+                admin, old, new = self.fixture(Path(directory))
+                original = admin.rows
+                def rows(sql, params=None):
+                    result = original(sql, params)
+                    return result * count if "FROM msdb.dbo.restorehistory" in sql else result
+                admin.rows = rows
+                self.assertEqual(self.execute(admin, old, new), 1)
+                self.assertFalse(admin.commands)
+                self.assertFalse(list(new.glob("*-verified.json")))
+
+    def test_failed_checksum_physical_or_attachment_reads_never_claim_success(self):
+        for failure in ("RESTORE VERIFYONLY", "DBCC CHECKDB", "attachments"):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(failure=failure):
+                admin, old, new = self.fixture(Path(directory))
+                if failure == "attachments": admin.attachment_failure = True
+                else: admin.fail_on = failure
+                self.assertEqual(self.execute(admin, old, new), 1)
+                self.assertFalse(list(new.glob("*-verified.json")))
+                failed = next(new.glob("*-failed.json"))
+                output = failed.read_text()
+                self.assertIn('"verified":false', output)
+                self.assertNotIn("PRIVATE_", output)
+                self.assertTrue(admin.clone and admin.backup_created)
+                self.assertTrue(all(command.startswith(("RESTORE VERIFYONLY", "DBCC CHECKDB")) for command in admin.commands))
+
+    def test_schema_change_prevents_attachment_reads_and_final_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            admin, old, new = self.fixture(Path(directory))
+            admin.schema_mismatch = True
+            self.assertEqual(self.execute(admin, old, new), 1)
+            self.assertFalse(list(new.glob("*-verified.json")))
+            self.assertEqual(len(admin.commands), 2)
+
+    def test_native_image_blob_count_uses_nullable_integer_expression(self):
+        admin = backup.SqlAdmin(Mock())
+        def rows(sql, params=None):
+            if "COUNT_BIG(FileData)" in sql:
+                raise RuntimeError("synthetic_sql_8117_image_aggregate_unsupported")
+            if "AS blob_rows" in sql:
+                self.assertIn("COUNT_BIG(CASE WHEN FileData IS NOT NULL THEN 1 END)", sql)
+                return [dict(file_rows=3, blob_rows=2, blob_bytes=20, size_metadata_mismatches=1)]
+            if "TOP (3)" in sql:
+                return [dict(bytes=10, digest="a" * 64)]
+            if "AS link_rows" in sql:
+                return [dict(link_rows=2, orphan_links=0)]
+            return [dict(attachment_right_rows=2)]
+        admin.rows = rows
+        result = admin.attachment_checks(backup.CLONE_PREFIX + RUN)
+        self.assertEqual(result["blob_rows"], 2)
+        self.assertEqual(result["size_metadata_mismatches"], 1)
+        self.assertTrue(result["sample_hash_reads_valid"])
+        self.assertNotIn("digest", result)
 
 
 if __name__ == "__main__":
