@@ -13,7 +13,20 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: receiptflow_test
+          POSTGRES_PASSWORD: test-only-no-production
+          POSTGRES_DB: receiptflow_test_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U receiptflow_test -d receiptflow_test_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     env:
+      RECEIPTFLOW_TEST_DATABASE_URL: postgresql+psycopg://receiptflow_test:test-only-no-production@127.0.0.1:5432/receiptflow_test_ci
       TELEGRAM_BOT_TOKEN: test-no-network
       OPENAI_API_KEY: ""
       PAYMENT_DRY_RUN: "true"

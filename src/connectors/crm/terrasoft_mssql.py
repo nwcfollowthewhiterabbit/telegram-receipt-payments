@@ -4,7 +4,7 @@ import datetime as dt
 import re
 from decimal import Decimal
 import calendar
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL, make_url
@@ -13,6 +13,7 @@ from sqlalchemy.exc import ArgumentError
 from src.config import get_settings
 from src.db.models import PaymentDraft, Receipt, ReceiptStatus
 from src.services.schemas import CrmSyncResult
+from src.connectors.crm.attachments import CrmAttachment, CrmConflict, ensure_attachment, native_xml
 
 
 TERRASOFT_TEST_DATABASE = "Terrasoft_test"
@@ -93,6 +94,129 @@ class TerrasoftMssqlConnector:
                 # Driver exceptions may contain connection details. Startup
                 # must fail without logging the URL or credentials.
                 raise RuntimeError("Terrasoft CRM target verification failed") from None
+        finally:
+            engine.dispose()
+
+    @staticmethod
+    def _wire_payload(payload: dict) -> dict:
+        return {key: value.isoformat() if isinstance(value, (dt.datetime, dt.date))
+                else str(value) if isinstance(value, Decimal) else value
+                for key, value in payload.items()}
+
+    @staticmethod
+    def _sql_payload(payload: dict) -> dict:
+        result = dict(payload)
+        for key in ("created_on", "modified_on", "estimated_date", "actual_date"):
+            if isinstance(result.get(key), str):
+                result[key] = dt.datetime.fromisoformat(result[key])
+        for key in ("amount", "basic_amount", "currency_rate"):
+            result[key] = Decimal(str(result[key]))
+        return result
+
+    def _require_enhanced_live(self) -> None:
+        if self.settings.crm_dry_run or not self.settings.crm_files_and_posting_enabled:
+            raise CrmConflict("crm_enhanced_sync_disabled")
+
+    def prepare_operation(self, operation_id: str, receipt: Receipt, draft: PaymentDraft) -> dict:
+        """Read-only mapping, persisted locally before the first external write."""
+        self._require_enhanced_live()
+        operation_id = str(UUID(operation_id))
+        if (self.settings.payment_dry_run_for(draft.provider_name)
+                or not draft.provider_payment_id or draft.provider_payment_id.startswith("dry-run-")):
+            raise CrmConflict("crm_live_bank_draft_required")
+        if draft.currency != "UAH":
+            raise CrmConflict("crm_only_uah_supported")
+        payload = self._build_payload(receipt, draft)
+        payload.update({"id": operation_id, "external_key": f"receipt-paybot:cashflow:{operation_id}",
+                        "status_id": CASHFLOW_STATUS_TO_PAY_ID,
+                        "provider": draft.provider_name, "bank_payment_id": draft.provider_payment_id,
+                        "source_account": draft.source_account, "beneficiary_iban": draft.beneficiary_iban,
+                        "beneficiary_tax_id": draft.beneficiary_tax_id, "currency": draft.currency,
+                        "purpose": draft.purpose, "document_number": f"RCPT{receipt.id:04d}"})
+        payload["comments_payer"] = self._comments_payer(receipt, draft, payload["external_key"])
+        engine = create_engine(self._validate_live_target(), future=True, pool_pre_ping=True,
+                               hide_parameters=True, connect_args={"login_timeout": 10, "timeout": 30})
+        try:
+            with engine.connect() as connection:
+                self._verify_connection_database(connection)
+                recipient = self._find_account_by_supplier_code(connection, receipt.extracted_supplier_tax_id)
+                payload["recipient_id"] = recipient["id"] if recipient else None
+                payload["recipient_match"] = None
+                self._attachment_policy(connection)
+        finally:
+            engine.dispose()
+        return self._wire_payload(payload)
+
+    def _attachment_policy(self, connection) -> tuple[str, int]:
+        root = native_xml(connection, "enm_FileTypes")
+        items = [el for el in root.iter("Item") if el.get("Code") == "ft_File"]
+        if len(items) != 1:
+            raise CrmConflict("crm_file_type_not_unique")
+        file_type = items[0].get("ID", "")
+        UUID(file_type)
+        limit = self.settings.crm_attachment_max_bytes
+        if limit <= 0 or limit > 20 * 1024 * 1024:
+            raise CrmConflict("crm_attachment_limit_invalid")
+        native_limits = connection.execute(text("""
+            SELECT IntegerValue FROM dbo.tbl_SystemSetting WHERE Code='MaxFileSize'
+        """)).scalars().all()
+        if len(native_limits) != 1 or not isinstance(native_limits[0], int) or native_limits[0] <= 0:
+            raise CrmConflict("crm_native_attachment_limit_invalid")
+        return file_type, min(limit, native_limits[0] * 1024 * 1024)
+
+    def ensure_operation(self, expected: dict, original: CrmAttachment) -> dict:
+        """Create Cashflow and its original file atomically; recover lost acks."""
+        from src.connectors.crm.terrasoft_posting import ensure_owner_rights
+
+        self._require_enhanced_live()
+        payload = self._sql_payload(expected)
+        operation_id = str(UUID(payload["id"]))
+        if payload["external_key"] != f"receipt-paybot:cashflow:{operation_id}":
+            raise CrmConflict("crm_operation_marker_invalid")
+        engine = create_engine(self._validate_live_target(), future=True, pool_pre_ping=True,
+                               hide_parameters=True, connect_args={"login_timeout": 10, "timeout": 30})
+        try:
+            with engine.begin() as connection:
+                self._verify_connection_database(connection)
+                connection.execute(text("SET XACT_ABORT ON; SET LOCK_TIMEOUT 5000"))
+                file_type, limit = self._attachment_policy(connection)
+                row = connection.execute(text("""
+                    SELECT CodPrivat,CFNumber FROM dbo.tbl_Cashflow WITH (UPDLOCK,HOLDLOCK)
+                    WHERE ID=CONVERT(uniqueidentifier,:id)
+                """), {"id": operation_id}).mappings().first()
+                if row:
+                    if row["CodPrivat"] != payload["external_key"]:
+                        raise CrmConflict("crm_operation_owned_by_another_source")
+                    cf_number = row["CFNumber"]
+                else:
+                    payload["cf_number"] = self._next_cf_number(connection)
+                    payload["period_id"] = self._ensure_period_id(connection, payload["estimated_date"])
+                    connection.execute(*self._build_cashflow_insert(payload))
+                    ensure_owner_rights(connection, operation_id, payload["owner_id"])
+                    cf_number = payload["cf_number"]
+                attachment = ensure_attachment(connection, operation_id, original,
+                                               file_type=file_type, max_bytes=limit)
+                return {"cf_number": cf_number, "source_attachment": attachment,
+                        "recipient_found": bool(payload["recipient_id"])}
+        finally:
+            engine.dispose()
+
+    def post_operation(self, operation_id: str, expected: dict, evidence, confirmation: CrmAttachment) -> dict:
+        """The same CRM transaction contains posting, its side effects and proof."""
+        from src.connectors.crm.terrasoft_posting import PostingService
+
+        self._require_enhanced_live()
+        engine = create_engine(self._validate_live_target(), future=True, pool_pre_ping=True,
+                               hide_parameters=True, connect_args={"login_timeout": 10, "timeout": 30})
+        try:
+            with engine.begin() as connection:
+                self._verify_connection_database(connection)
+                connection.execute(text("SET XACT_ABORT ON; SET LOCK_TIMEOUT 5000"))
+                file_type, limit = self._attachment_policy(connection)
+                result = PostingService(connection).post(operation_id, expected, evidence)
+                attached = ensure_attachment(connection, operation_id, confirmation,
+                                             file_type=file_type, max_bytes=limit)
+                return {**result, "confirmation_attachment": attached}
         finally:
             engine.dispose()
 

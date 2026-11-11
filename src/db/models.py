@@ -113,3 +113,35 @@ class AuthorizedUser(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
     )
+
+
+class CrmOperation(Base):
+    """Durable outbox for a single new bank draft, never a historical replay.
+
+    The ID is allocated and committed locally with the bank draft before any
+    CRM request. It is also the external Cashflow UUID, so a lost response can
+    be retried without creating a second operation. The unique transaction key
+    prevents one bank execution from settling two different bot operations.
+    """
+
+    __tablename__ = "crm_operations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    payment_draft_id: Mapped[int] = mapped_column(
+        ForeignKey("payment_drafts.id", ondelete="RESTRICT"), unique=True, nullable=False
+    )
+    target_database: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(48), default="pending_create", index=True)
+    cf_number: Mapped[str | None] = mapped_column(String(64))
+    bank_transaction_key: Mapped[str | None] = mapped_column(String(255), unique=True)
+    source_sha256: Mapped[str | None] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    last_error: Mapped[str | None] = mapped_column(String(160))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
+    )
+
+    payment_draft: Mapped[PaymentDraft] = relationship()

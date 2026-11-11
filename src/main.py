@@ -10,6 +10,7 @@ from src.bot.handlers import register_handlers
 from src.config import get_settings
 from src.connectors.crm.registry import build_crm_connector
 from src.connectors.payments.privat24_receipt_monitor import PaymentReceiptMonitor
+from src.connectors.communication.crm_monitor import CrmWorkflowMonitor
 from src.db.session import init_db
 
 
@@ -26,9 +27,16 @@ async def main() -> None:
     register_handlers(dp)
     receipt_monitor = PaymentReceiptMonitor(bot)
     monitor_task = asyncio.create_task(receipt_monitor.run())
+    crm_monitor_task = None
+    if getattr(settings, "crm_files_and_posting_enabled", False) and not settings.crm_dry_run:
+        crm_monitor_task = asyncio.create_task(CrmWorkflowMonitor(bot).run())
     try:
         await dp.start_polling(bot)
     finally:
+        if crm_monitor_task:
+            crm_monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await crm_monitor_task
         monitor_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await monitor_task

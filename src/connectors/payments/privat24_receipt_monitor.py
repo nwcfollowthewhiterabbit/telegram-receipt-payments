@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from src.clients.privat24 import Privat24Client
 from src.config import get_settings
-from src.db.models import AuthorizedUser, PaymentDraft, Receipt
+from src.db.models import AuthorizedUser, CrmOperation, PaymentDraft, Receipt
 from src.db.session import SessionLocal
 
 
@@ -115,6 +115,7 @@ class PaymentReceiptMonitor:
             db.query(PaymentDraft)
             .join(Receipt, Receipt.id == PaymentDraft.receipt_id)
             .filter(PaymentDraft.provider_name == "privat24")
+            .filter(~db.query(CrmOperation.id).filter(CrmOperation.payment_draft_id == PaymentDraft.id).exists())
             .filter(~PaymentDraft.provider_payment_id.like("dry-run-%"))
             .order_by(PaymentDraft.id.asc())
             .all()

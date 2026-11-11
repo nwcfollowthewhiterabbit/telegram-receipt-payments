@@ -19,6 +19,7 @@ from .purpose_builder import PaymentPurposeBuilder
 from .schemas import PaymentDraftValidationResult, ReceiptValidationResult
 from .vision import ReceiptVisionService
 from .supplier_identity import supplier_identity_errors
+from .crm_sync import CrmSyncService, enabled as enhanced_crm_enabled, enroll as enroll_crm_operation
 
 
 class ReceiptPipeline:
@@ -470,6 +471,18 @@ class ReceiptPipeline:
         else:
             receipt.status = ReceiptStatus.payment_draft_failed
         db.add(receipt)
+        crm_operation = None
+        enhanced = enhanced_crm_enabled(self.settings, payment_draft.provider_name)
+        if draft_result.created and enhanced:
+            if not payment_draft.provider_payment_id or payment_draft.provider_payment_id.startswith("dry-run-"):
+                # A successful HTTP response can omit a usable identity even
+                # though the bank created the draft. Persist that attempt and
+                # never turn CRM failure into an implicit second bank create.
+                receipt.validation_payload = {**(receipt.validation_payload or {}),
+                    "crm_enhanced_state": "manual_review",
+                    "crm_enhanced_error": "crm_bank_draft_identity_missing"}
+            else:
+                crm_operation = enroll_crm_operation(db, receipt, payment_draft, self.settings)
         db.commit()
         db.refresh(receipt)
 
@@ -481,7 +494,11 @@ class ReceiptPipeline:
             message="Payment draft processed",
             payload=draft_result.model_dump(mode="json"),
         )
-        self._sync_crm(db, receipt.telegram_user_id, receipt, payment_draft)
+        if crm_operation is not None:
+            CrmSyncService(settings=self.settings).prepare_and_create(crm_operation.id)
+            db.refresh(receipt)
+        elif draft_result.created and not enhanced:
+            self._sync_crm(db, receipt.telegram_user_id, receipt, payment_draft)
         return receipt
 
     def _sync_crm(

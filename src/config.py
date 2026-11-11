@@ -118,6 +118,15 @@ class Settings:
     monobank_dry_run: bool = field(default_factory=lambda: _parse_bool(os.getenv("MONOBANK_DRY_RUN"), True))
     crm_provider: str = field(default_factory=lambda: _env_or_default("CRM_PROVIDER", "none").lower())
     crm_dry_run: bool = field(default_factory=lambda: _parse_bool(os.getenv("CRM_DRY_RUN"), True))
+    crm_files_and_posting_enabled: bool = field(
+        default_factory=lambda: _parse_bool(os.getenv("CRM_FILES_AND_POSTING_ENABLED"), False)
+    )
+    crm_sync_poll_seconds: int = field(
+        default_factory=lambda: int(_env_or_default("CRM_SYNC_POLL_SECONDS", "60"))
+    )
+    crm_attachment_max_bytes: int = field(
+        default_factory=lambda: int(_env_or_default("CRM_ATTACHMENT_MAX_BYTES", "20971520"))
+    )
     terrasoft_mssql_url: str = field(default_factory=lambda: os.getenv("TERRASOFT_MSSQL_URL", ""))
     terrasoft_invoice_table: str = field(default_factory=lambda: os.getenv("TERRASOFT_INVOICE_TABLE", ""))
     terrasoft_database: str = field(default_factory=lambda: _env_or_default("TERRASOFT_DATABASE", "Terrasoft_test"))
@@ -148,6 +157,12 @@ class Settings:
             raise RuntimeError("CRM_PROVIDER must be either none or terrasoft_mssql")
         if self.communication_provider not in {"telegram"}:
             raise RuntimeError("COMMUNICATION_PROVIDER must be telegram")
+        if self.crm_files_and_posting_enabled and self.crm_provider != "terrasoft_mssql":
+            raise RuntimeError("CRM_FILES_AND_POSTING_ENABLED requires terrasoft_mssql")
+        if not 30 <= self.crm_sync_poll_seconds <= 900:
+            raise RuntimeError("CRM_SYNC_POLL_SECONDS must be between 30 and 900")
+        if not 0 < self.crm_attachment_max_bytes <= 20 * 1024 * 1024:
+            raise RuntimeError("CRM_ATTACHMENT_MAX_BYTES must be between 1 and 20971520")
 
 
 @lru_cache

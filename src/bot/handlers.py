@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 from uuid import uuid4
 
 from aiogram import Dispatcher, F
@@ -115,6 +116,8 @@ def _is_ready_for_payment_choice(receipt: Receipt) -> bool:
 
 
 def _receipt_status_label(receipt: Receipt) -> str:
+    if (receipt.validation_payload or {}).get("crm_enhanced_error") == "crm_bank_draft_identity_missing":
+        return "банк повернув неповну відповідь; перевірте чернетку в банку перед повторною спробою"
     if _is_ready_for_payment_choice(receipt):
         return "очікує вибору банку, платіж ще не створено"
     if receipt.status == ReceiptStatus.dry_run_created:
@@ -126,6 +129,86 @@ def _receipt_status_label(receipt: Receipt) -> str:
     if receipt.status == ReceiptStatus.requires_manual_review:
         return "потрібна ручна перевірка"
     return receipt.status.value
+
+
+def _crm_status_lines(receipt: Receipt, *, include_command: bool = False) -> list[str]:
+    """Render only persisted progress, without interpreting raw dependency errors."""
+    payload = receipt.validation_payload or {}
+    state = payload.get("crm_enhanced_state")
+    lines = [f"Рахунок у боті: RCPT{receipt.id:04d}"]
+    cf_number = payload.get("crm_cf_number")
+    if isinstance(cf_number, str) and re.fullmatch(r"CF[0-9]{1,20}", cf_number):
+        lines.append(f"Операція CRM: {cf_number}")
+        if payload.get("crm_recipient_found") is False:
+            lines.append("Контрагента не знайдено за кодом. Попросіть бухгалтера перевірити контрагента в CRM.")
+    if payload.get("crm_source_attached") is True:
+        lines.append("Оригінал рахунку додано до CRM.")
+
+    if payload.get("crm_enhanced_error") == "crm_bank_draft_identity_missing":
+        lines.append("Банк не повернув ідентифікатор чернетки. Вона могла вже створитися: "
+                     "перевірте банк із бухгалтером. Автоматичне проведення зупинено; не створюйте повторний платіж.")
+    elif state == "posted":
+        lines.append("Оплату підтверджено банком. Операцію в CRM проведено, підтвердження оплати додано.")
+    elif payload.get("crm_enhanced_error"):
+        if state == "confirmed":
+            lines.append("Банк підтвердив оплату, але завершення проведення в CRM ще не підтверджено. "
+                         "Бот повторить перевірку; якщо стан не зміниться, зверніться до бухгалтера.")
+        elif state == "waiting_payment":
+            lines.append("Підтвердження оплати потребує перевірки. Проведення в CRM ще не підтверджено. "
+                         "Бот повторить перевірку; якщо стан не зміниться, зверніться до бухгалтера.")
+        else:
+            lines.append("Не вдалося підтвердити створення операції та додавання рахунку в CRM. "
+                         "Бот повторить перевірку. Не створюйте повторний платіж; зверніться до бухгалтера.")
+    elif state in {"pending_create", "prepared"}:
+        lines.append("Готуємо операцію CRM та додаємо оригінал рахунку.")
+    elif state == "waiting_payment":
+        lines.append("Очікуємо підтвердження виконання платежу банком. "
+                     "Створена чернетка ще не означає оплату.")
+    elif state == "confirmed":
+        lines.append("Банк підтвердив виконання платежу. Додаємо підтвердження оплати та проводимо операцію CRM.")
+    elif state:
+        lines.append("Стан CRM потребує перевірки бухгалтером. Проведення оплати ще не підтверджено.")
+    else:
+        lines.append("Автоматичне додавання файлів і підтвердження оплати для цього рахунку не відстежуються. "
+                     "Перевірте операцію в CRM.")
+
+    if state and payload.get("payment_provider") == "monobank":
+        if state == "posted":
+            lines.append("Підтвердження monobank у CRM — банківська виписка у JSON. "
+                         "PDF-квитанцію за потреби додайте вручну до цієї операції CRM.")
+        else:
+            lines.append("Після підтвердження оплати до CRM додається виписка monobank у JSON. "
+                         "PDF-квитанцію за потреби додайте вручну до операції CRM.")
+    if include_command:
+        lines.append(f"Перевірити стан: /crm_status RCPT{receipt.id:04d}")
+    return lines
+
+
+async def _handle_crm_status(message: Message) -> None:
+    """Read local status for this sender in the original chat; never reconcile."""
+    try:
+        if not message.from_user or not _is_allowed(message.from_user.id):
+            await message.answer("Доступ заборонено. Спочатку підтвердьте номер телефону через /start.")
+            return
+        parts = (message.text or "").split()
+        match = re.fullmatch(r"RCPT([0-9]{1,10})", parts[1].upper()) if len(parts) == 2 else None
+        if match is None or not 1 <= int(match.group(1)) <= 2147483647:
+            await message.answer("Вкажіть номер рахунку, наприклад: /crm_status RCPT0001")
+            return
+        with SessionLocal() as db:
+            receipt = (db.query(Receipt).filter(
+                Receipt.id == int(match.group(1)),
+                Receipt.telegram_user_id == message.from_user.id,
+                Receipt.telegram_chat_id == message.chat.id,
+            ).first())
+            if receipt is None:
+                response = "Рахунок не знайдено серед ваших рахунків у цьому чаті. Перевірте номер RCPT."
+            else:
+                response = "Збережений стан CRM:\n" + "\n".join(_crm_status_lines(receipt))
+        await message.answer(response, parse_mode=None)
+    except Exception:
+        logger.warning("Could not read CRM status")
+        await message.answer("Не вдалося перевірити стан CRM. Спробуйте пізніше.")
 
 
 def _render_receipt_result(receipt) -> str:
@@ -180,7 +263,9 @@ def _render_receipt_result(receipt) -> str:
         lines.append(f"Помилки контрольної перевірки: {', '.join(payment_validation_errors)}")
     elif payment_validation.get("summary"):
         lines.append(f"Контрольна перевірка: {payment_validation['summary']}")
-    if receipt.validation_payload.get("crm_sync_status") == "crm_synced":
+    if receipt.validation_payload.get("crm_enhanced_state"):
+        lines.extend(_crm_status_lines(receipt, include_command=True))
+    elif receipt.validation_payload.get("crm_sync_status") == "crm_synced":
         cf_number = receipt.validation_payload.get("crm_cf_number")
         if cf_number:
             lines.append(f"CRM операція: {cf_number}")
@@ -251,6 +336,8 @@ async def _process_or_confirm_duplicate(message: Message, incoming_file: StoredI
 
 
 def register_handlers(dp: Dispatcher) -> None:
+    dp.message(Command("crm_status"))(_handle_crm_status)
+
     @dp.message(Command("start"))
     async def handle_start(message: Message) -> None:
         if not _is_allowed(message.from_user.id):
@@ -267,7 +354,7 @@ def register_handlers(dp: Dispatcher) -> None:
             )
             return
         await message.answer(
-            f"Поточний режим за замовчуванням: {_mode_label()}.\nНадішліть рахунок на оплату як фото, PDF, XLS або XLSX. Бот розпізнає реквізити, виконає preflight-перевірку, збереже результат у БД і запропонує вибрати Приват24 або monobank для чернетки платежу.",
+            f"Поточний режим за замовчуванням: {_mode_label()}.\nНадішліть рахунок на оплату як фото, PDF, XLS або XLSX. Бот розпізнає реквізити, перевірить їх і запропонує вибрати Приват24 або monobank для чернетки платежу.\nСтан вашого рахунку в CRM: /crm_status RCPT0001 (у чаті, де ви надіслали рахунок).",
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -482,4 +569,5 @@ def register_handlers(dp: Dispatcher) -> None:
                 reply_markup=_contact_request_keyboard(),
             )
             return
-        await message.answer("Очікую рахунок на оплату як фото, PDF, XLS або XLSX. Команда /start покаже коротку інструкцію.")
+        await message.answer("Очікую рахунок на оплату як фото, PDF, XLS або XLSX. "
+                             "Стан вашого рахунку: /crm_status RCPT0001. Команда /start покаже коротку інструкцію.")
