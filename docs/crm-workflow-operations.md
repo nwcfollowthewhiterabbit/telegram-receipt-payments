@@ -6,6 +6,12 @@
 после successful exact-SHA CI: checks, package-build, foundation-instance.
 Образ берётся из artifact этого CI, проверяются SHA256 архива, image ID и
 OCI revision. На сервере исходники не собираются заново.
+Проверочные контейнеры получают effective environment через
+`scripts.backup_bot.compose_environment()` → Docker `--env-file /dev/stdin`.
+Это важно: Compose снимает кавычки dotenv, обычный Docker `--env-file .env`
+сохраняет их в значениях. Environment не печатается и не копируется в файл;
+helper отклоняет multiline/NUL значения. Startup/actual DB_NAME guard
+остаётся обязательным независимо от способа передачи конфигурации.
 
 1. `scripts/verify_terrasoft_backup.py` без `--execute`: read-only plan.
    После проверки свободного места, точной цели и отсутствия новых путей

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout, redirect_stderr
 import datetime as dt
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -70,6 +71,42 @@ class EvidenceContractTest(unittest.TestCase):
                 deploy_bot.read_journal(path)
 
 
+class ComposeEnvironmentTest(unittest.TestCase):
+    def test_effective_values_preserve_literal_characters_without_dotenv_quotes_or_logging(self):
+        values = {"TERRASOFT_DATABASE": "Terrasoft", "EMPTY_VALUE": "",
+                  "SYNTHETIC_SECRET": "keep 'quotes' \"double\" = # $literal $(no-shell)"}
+        config = json.dumps({"services": {"bot": {"environment": values}}}).encode()
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(backup_bot, "run", return_value=config) as run, \
+             redirect_stdout(output), redirect_stderr(errors):
+            result = backup_bot.compose_environment()
+        self.assertIn(b"TERRASOFT_DATABASE=Terrasoft\n", result)
+        self.assertNotIn(b"TERRASOFT_DATABASE='Terrasoft'", result)
+        self.assertIn(("SYNTHETIC_SECRET=" + values["SYNTHETIC_SECRET"] + "\n").encode(), result)
+        self.assertIn(b"EMPTY_VALUE=\n", result)
+        self.assertEqual(output.getvalue() + errors.getvalue(), "")
+        self.assertEqual(run.call_args.args[0],
+                         ["docker", "compose", "-p", "receipt-paybot", "config", "--format", "json"])
+        self.assertNotIn(values["SYNTHETIC_SECRET"], repr(run.call_args))
+
+    def test_invalid_environment_keys_values_and_line_injection_are_rejected(self):
+        invalid = [[], {"BAD=KEY": "value"}, {"1INVALID": "value"},
+                   {"VALID": None}, {"VALID": 123}, {"VALID": True},
+                   {"VALID": "before\nafter"}, {"VALID": "before\rafter"},
+                   {"VALID": "before\0after"}, {"BAD\nKEY": "value"}]
+        for values in invalid:
+            config = json.dumps({"services": {"bot": {"environment": values}}}).encode()
+            with self.subTest(values=values), patch.object(backup_bot, "run", return_value=config), \
+                 self.assertRaisesRegex(RuntimeError, "^effective_environment_invalid$"):
+                backup_bot.compose_environment()
+
+    def test_subprocess_failure_never_surfaces_captured_environment_or_stderr(self):
+        result = SimpleNamespace(returncode=1, stdout=b"SYNTHETIC_PRIVATE_ENV", stderr=b"SYNTHETIC_PRIVATE_ERROR")
+        with patch.object(backup_bot.subprocess, "run", return_value=result), \
+             self.assertRaisesRegex(RuntimeError, "^command_failed:docker$"):
+            backup_bot.compose_environment()
+
+
 class ReleasePlanTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -105,6 +142,8 @@ class ReleasePlanTest(unittest.TestCase):
         self.rehearsal_path.write_text(json.dumps(rehearsal))
         (self.releases / SHA).mkdir(mode=0o700)
         self.calls = []
+        self.container_stdin = []
+        self.effective_environment = {"TERRASOFT_DATABASE": "Terrasoft", "SYNTHETIC_SECRET": "PRIVATE_EFFECTIVE_VALUE"}
         self.bot_reads = []
         self.current_image = OLD_IMAGE
         self.current_running = False
@@ -164,11 +203,14 @@ class ReleasePlanTest(unittest.TestCase):
         if args[:2] == ["docker", "run"]:
             if "--read-only" not in args or "--rm" not in args:
                 raise AssertionError("Unexpected mutable Docker run")
+            self.container_stdin.append(kwargs.get("input"))
             return b"candidate_preflight_passed"
         if args[:2] == ["docker", "start"]:
             self.current_running = True
             return b"synthetic-bot-container"
         if args[:4] == ["docker", "compose", "-p", "receipt-paybot"]:
+            if args[4:] == ["config", "--format", "json"]:
+                return json.dumps({"services": {"bot": {"environment": self.effective_environment}}}).encode()
             if "up" in args:
                 self.current_running = True
                 old = (self.root / "docker-compose.override.yml").resolve() == self.old_override
@@ -182,7 +224,8 @@ class ReleasePlanTest(unittest.TestCase):
     def assert_no_release_mutation(self):
         self.assertEqual((self.root / "docker-compose.override.yml").resolve(), self.old_override)
         self.assertFalse((self.releases / SHA / "compose.release.yml").exists())
-        self.assertFalse(any(args[:4] == ["docker", "compose", "-p", "receipt-paybot"] for args in self.calls))
+        self.assertFalse(any(args[:4] == ["docker", "compose", "-p", "receipt-paybot"]
+                             and args[4:5] != ["config"] for args in self.calls))
 
     def test_backup_default_plan_is_read_only(self):
         result = backup_bot.perform(self.args())
@@ -208,6 +251,22 @@ class ReleasePlanTest(unittest.TestCase):
         self.assertEqual(result["mode"], "read_only_plan")
         self.assert_no_release_mutation()
         self.assertFalse(self.current_running)
+
+    def test_preflight_passes_effective_environment_only_as_stdin_bytes(self):
+        # A quoted dotenv source must not be fed directly to docker --env-file.
+        quoted = b"TERRASOFT_DATABASE='Terrasoft'\n"
+        (self.root / ".env").write_bytes(quoted)
+        (self.backup / "previous.env").write_bytes(quoted)
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            deploy_bot.perform(self.args())
+        self.assertEqual(self.container_stdin,
+                         [b"SYNTHETIC_SECRET=PRIVATE_EFFECTIVE_VALUE\nTERRASOFT_DATABASE=Terrasoft\n"])
+        docker_run = next(args for args in self.calls if args[:2] == ["docker", "run"])
+        self.assertEqual(docker_run[docker_run.index("--env-file") + 1], "/dev/stdin")
+        self.assertNotIn(str(self.root / ".env"), docker_run)
+        self.assertNotIn("PRIVATE_EFFECTIVE_VALUE", repr(self.calls) + output.getvalue() + errors.getvalue())
+        self.assert_no_release_mutation()
 
     def test_changed_override_or_environment_blocks_before_swap(self):
         for file in (self.old_override, self.root / ".env"):

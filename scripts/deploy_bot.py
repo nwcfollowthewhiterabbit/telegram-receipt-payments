@@ -14,7 +14,7 @@ import re
 import subprocess
 import time
 
-from scripts.backup_bot import ROOT, BACKUPS, digest, run
+from scripts.backup_bot import ROOT, BACKUPS, compose_environment, digest, run
 
 
 def read_journal(path):
@@ -117,8 +117,8 @@ engine.dispose()
 print('candidate_preflight_passed')
 '''
     run(['docker', 'run', '--rm', '--read-only', '--tmpfs', '/tmp:rw,size=64m',
-         '--env-file', str(ROOT / '.env'), '-e', 'CRM_FILES_AND_POSTING_ENABLED=true',
-         '-v', str(evidence) + ':/evidence/verified.json:ro', image, 'python', '-c', preflight])
+         '--env-file', '/dev/stdin', '-e', 'CRM_FILES_AND_POSTING_ENABLED=true',
+         '-v', str(evidence) + ':/evidence/verified.json:ro', image, 'python', '-c', preflight], input=compose_environment())
     if not args.execute:
         return {'mode': 'read_only_plan', 'preflight_passed': True, 'image_revision': args.execution_sha}
     release = Path('/home/ubuntu/receipt-paybot-releases') / args.execution_sha

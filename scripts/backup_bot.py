@@ -27,6 +27,24 @@ def run(args, **kw):
     return result.stdout
 
 
+def compose_environment():
+    """Use Compose's effective environment, including dotenv quoting semantics.
+
+    Never print or persist the returned bytes. Feed them directly to Docker's
+    --env-file /dev/stdin; no shell interpolation or credential copying.
+    """
+    config = json.loads(run(['docker', 'compose', '-p', 'receipt-paybot', 'config', '--format', 'json'], cwd=ROOT))
+    values = config['services']['bot']['environment']
+    if not isinstance(values, dict):
+        raise RuntimeError('effective_environment_invalid')
+    lines = []
+    for key, value in sorted(values.items()):
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key) or not isinstance(value, str) or any(c in value for c in ('\n', '\r', '\0')):
+            raise RuntimeError('effective_environment_invalid')
+        lines.append(key + '=' + value)
+    return ('\n'.join(lines) + '\n').encode()
+
+
 def digest(path):
     h = hashlib.sha256()
     with open(path, 'rb') as stream:
